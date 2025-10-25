@@ -9,7 +9,7 @@ permissions:
   packages: write
 
 env:
-  DOCKERHUB_REPO: ${{ vars.DOCKERHUB_REPO }}
+  DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_REPO }}
   GO_VERSION: 1.24.6
   BUILD_PLATFORMS: ${{ vars.BUILD_PLATFORMS || 'linux/amd64,linux/arm64' }}
 
