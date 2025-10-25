@@ -2,9 +2,8 @@
 FROM gcr.io/distroless/static:nonroot
 
 ARG TARGETARCH
-ARG BIN=./.dev/bin/apiserver-linux-${TARGETARCH}
-
-COPY ${BIN} /apiserver
+# Copy the prebuilt binary for the target arch from the build context
+COPY ./.dev/bin/apiserver-linux-${TARGETARCH} /apiserver
 
 USER 65532:65532
 ENTRYPOINT ["/apiserver"]
