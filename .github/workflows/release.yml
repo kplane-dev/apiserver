@@ -11,7 +11,7 @@ permissions:
 env:
   DOCKERHUB_REPO: ${{ vars.DOCKERHUB_REPO }}
   GO_VERSION: 1.24.6
-  IMAGE_REPO: ${{ vars.DOCKERHUB_REPO != '' && vars.DOCKERHUB_REPO || github.repository }}
+  IMAGE_REPO: ${{ vars.DOCKERHUB_REPO || github.repository }}
 
 jobs:
   build-and-push:
@@ -39,6 +39,9 @@ jobs:
           tag_name="${{ github.event.release.tag_name }}"
           if [ -z "$tag_name" ]; then
             tag_name="${GITHUB_REF#refs/tags/}"
+          fi
+          if [ -z "$tag_name" ] || [ "$tag_name" = "$GITHUB_REF" ]; then
+            tag_name="local"
           fi
           echo "tag=$tag_name" >> "$GITHUB_OUTPUT"
           echo "version=$tag_name" >> "$GITHUB_OUTPUT"
