@@ -11,6 +11,7 @@ permissions:
 env:
   DOCKERHUB_REPO: ${{ vars.DOCKERHUB_REPO }}
   GO_VERSION: 1.24.6
+  IMAGE_REPO: ${{ vars.DOCKERHUB_REPO != '' && vars.DOCKERHUB_REPO || github.repository }}
 
 jobs:
   build-and-push:
@@ -35,9 +36,12 @@ jobs:
       - name: Extract version and tags
         id: meta
         run: |
-          ref="${GITHUB_REF#refs/tags/}"
-          echo "tag=$ref" >> "$GITHUB_OUTPUT"
-          echo "version=$ref" >> "$GITHUB_OUTPUT"
+          tag_name="${{ github.event.release.tag_name }}"
+          if [ -z "$tag_name" ]; then
+            tag_name="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag_name" >> "$GITHUB_OUTPUT"
+          echo "version=$tag_name" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -47,8 +51,8 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.tag }}
-            ${{ env.DOCKERHUB_REPO }}:latest
+            ${{ env.IMAGE_REPO }}:${{ steps.meta.outputs.tag }}
+            ${{ env.IMAGE_REPO }}:latest
           build-args: |
             GO_VERSION=${{ env.GO_VERSION }}
 
