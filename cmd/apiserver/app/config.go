@@ -35,6 +35,7 @@ import (
 	"github.com/kplane-dev/apiserver/cmd/apiserver/app/options"
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
 	mca "github.com/kplane-dev/apiserver/pkg/multicluster/admission"
+	mcwh "github.com/kplane-dev/apiserver/pkg/multicluster/admission/webhook"
 )
 
 type Config struct {
@@ -83,6 +84,15 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		Options: opts,
 	}
 
+	// We provide cluster-aware webhook admission below; disable upstream single-cluster webhooks.
+	if opts.Admission != nil && opts.Admission.GenericAdmission != nil {
+		opts.Admission.GenericAdmission.DisablePlugins = append(
+			opts.Admission.GenericAdmission.DisablePlugins,
+			"MutatingAdmissionWebhook",
+			"ValidatingAdmissionWebhook",
+		)
+	}
+
 	genericConfig, versionedInformers, storageFactory, err := controlplaneapiserver.BuildGenericConfig(
 		opts.CompletedOptions,
 		[]*runtime.Scheme{legacyscheme.Scheme, apiextensionsapiserver.Scheme, aggregatorscheme.Scheme},
@@ -124,16 +134,35 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		return nil, err
 	}
 	c.KubeAPIs = kubeAPIs
+
+	// Cluster-aware webhook admission (per-cluster clients + informers, no global cross-cluster view).
+	authWrapper := webhook.NewDefaultAuthenticationInfoResolverWrapper(
+		kubeAPIs.ControlPlane.ProxyTransport,
+		kubeAPIs.ControlPlane.Generic.EgressSelector,
+		kubeAPIs.ControlPlane.Generic.LoopbackClientConfig,
+		kubeAPIs.ControlPlane.Generic.TracerProvider,
+	)
+	mcWebhookMgr := mcwh.NewManager(mcwh.Options{
+		BaseLoopbackClientConfig: kubeAPIs.ControlPlane.Generic.LoopbackClientConfig,
+		AuthWrapper:              authWrapper,
+		EnableAggregatorRouting:  opts.EnableAggregatorRouting,
+		Hostname:                 kubeAPIs.ControlPlane.Generic.LoopbackClientConfig.Host,
+		PathPrefix:               mcOpts.PathPrefix,
+		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
+	})
+	mcMutatingWebhook := mcwh.NewMutating(mcOpts, mcWebhookMgr)
+	mcValidatingWebhook := mcwh.NewValidating(mcOpts, mcWebhookMgr)
+
 	// Reinstall admission chain on concrete generics to avoid later overrides
 	{
 		mut := mca.NewMutating(mcOpts)
 		val := mca.NewValidating(mcOpts)
 		base := c.KubeAPIs.ControlPlane.Generic.AdmissionControl
-		chain := []admission.Interface{mut}
+		chain := []admission.Interface{mut, mcMutatingWebhook}
 		if base != nil {
 			chain = append(chain, base)
 		}
-		chain = append(chain, val)
+		chain = append(chain, mcValidatingWebhook, val)
 		c.KubeAPIs.ControlPlane.Generic.AdmissionControl = admission.NewChainHandler(chain...)
 	}
 
@@ -152,11 +181,11 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		mut := mca.NewMutating(mcOpts)
 		val := mca.NewValidating(mcOpts)
 		base := apiExtensions.GenericConfig.AdmissionControl
-		chain := []admission.Interface{mut}
+		chain := []admission.Interface{mut, mcMutatingWebhook}
 		if base != nil {
 			chain = append(chain, base)
 		}
-		chain = append(chain, val)
+		chain = append(chain, mcValidatingWebhook, val)
 		apiExtensions.GenericConfig.AdmissionControl = admission.NewChainHandler(chain...)
 	}
 	c.ApiExtensions = apiExtensions
@@ -175,11 +204,11 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		mut := mca.NewMutating(mcOpts)
 		val := mca.NewValidating(mcOpts)
 		base := aggregator.GenericConfig.AdmissionControl
-		chain := []admission.Interface{mut}
+		chain := []admission.Interface{mut, mcMutatingWebhook}
 		if base != nil {
 			chain = append(chain, base)
 		}
-		chain = append(chain, val)
+		chain = append(chain, mcValidatingWebhook, val)
 		aggregator.GenericConfig.AdmissionControl = admission.NewChainHandler(chain...)
 	}
 	c.Aggregator = aggregator
