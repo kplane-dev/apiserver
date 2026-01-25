@@ -3,6 +3,7 @@ package multicluster
 import (
 	"context"
 	"strings"
+	"sync"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -43,92 +44,254 @@ func (w RESTOptionsDecorator) GetRESTOptions(resource schema.GroupResource, exam
 		trigger storage.IndexerFuncs,
 		indexers *cache.Indexers,
 	) (storage.Interface, factory.DestroyFunc, error) {
-		s, destroy, err := base(config, resourcePrefix, keyFunc, newFunc, newListFunc, getAttrsFunc, trigger, indexers)
-		if err != nil {
-			return s, destroy, err
-		}
-		return keyRewritingStorage{Interface: s, Options: w.Options, Layout: layout}, destroy, nil
+		return newClusteredStorage(
+			base,
+			config,
+			resourcePrefix,
+			keyFunc,
+			newFunc,
+			newListFunc,
+			getAttrsFunc,
+			trigger,
+			indexers,
+			w.Options,
+			layout,
+		)
 	}
 	return opts, nil
 }
 
-// keyRewritingStorage wraps a storage.Interface and injects a cluster segment
-// after the resource in keys for CRUD based on request context. For list/watch,
-// it keeps kind-root prefixes intact (KindRoot strategy) and filters by annotation.
+type clusteredStorage struct {
+	base           generic.StorageDecorator
+	config         *storagebackend.ConfigForResource
+	resourcePrefix string
+	keyFunc        func(obj runtime.Object) (string, error)
+	newFunc        func() runtime.Object
+	newListFunc    func() runtime.Object
+	getAttrsFunc   storage.AttrFunc
+	trigger        storage.IndexerFuncs
+	indexers       *cache.Indexers
+	options        Options
+	layout         KeyLayout
 
-type keyRewritingStorage struct {
-	storage.Interface
-	Options Options
-	Layout  KeyLayout
+	mu       sync.Mutex
+	stores   map[string]storage.Interface
+	destroys map[string]factory.DestroyFunc
+	global   storage.Interface
 }
 
-func (w keyRewritingStorage) Get(ctx context.Context, key string, opts storage.GetOptions, objPtr runtime.Object) error {
-	key = w.rewriteKey(ctx, key, false)
-	return w.Interface.Get(ctx, key, opts, objPtr)
-}
-
-func (w keyRewritingStorage) Create(ctx context.Context, key string, obj, out runtime.Object, ttl uint64) error {
-	key = w.rewriteKey(ctx, key, false)
-	return w.Interface.Create(ctx, key, obj, out, ttl)
-}
-
-func (w keyRewritingStorage) Delete(ctx context.Context, key string, out runtime.Object, preconditions *storage.Preconditions, validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object, opts storage.DeleteOptions) error {
-	key = w.rewriteKey(ctx, key, false)
-	return w.Interface.Delete(ctx, key, out, preconditions, validateDeletion, cachedExistingObject, opts)
-}
-
-func (w keyRewritingStorage) GetList(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
-	key = w.rewriteKey(ctx, key, true)
-	if err := w.Interface.GetList(ctx, key, opts, listObj); err != nil {
-		return err
+func newClusteredStorage(
+	base generic.StorageDecorator,
+	config *storagebackend.ConfigForResource,
+	resourcePrefix string,
+	keyFunc func(obj runtime.Object) (string, error),
+	newFunc func() runtime.Object,
+	newListFunc func() runtime.Object,
+	getAttrsFunc storage.AttrFunc,
+	trigger storage.IndexerFuncs,
+	indexers *cache.Indexers,
+	options Options,
+	layout KeyLayout,
+) (storage.Interface, factory.DestroyFunc, error) {
+	cs := &clusteredStorage{
+		base:           base,
+		config:         config,
+		resourcePrefix: resourcePrefix,
+		keyFunc:        keyFunc,
+		newFunc:        newFunc,
+		newListFunc:    newListFunc,
+		getAttrsFunc:   getAttrsFunc,
+		trigger:        trigger,
+		indexers:       indexers,
+		options:        options,
+		layout:         layout,
+		stores:         map[string]storage.Interface{},
+		destroys:       map[string]factory.DestroyFunc{},
 	}
-	cid, all, _ := FromContext(ctx)
-	if all || cid == "" {
+	return cs, cs.destroy, nil
+}
+
+func (c *clusteredStorage) Versioner() storage.Versioner {
+	store, err := c.storeForCluster(c.defaultCluster())
+	if err != nil {
 		return nil
 	}
-	return filterListByCluster(listObj, cid, w.Options.ClusterAnnotationKey)
+	return store.Versioner()
 }
 
-func (w keyRewritingStorage) Watch(ctx context.Context, key string, opts storage.ListOptions) (watch.Interface, error) {
-	key = w.rewriteKey(ctx, key, true)
-	wi, err := w.Interface.Watch(ctx, key, opts)
+func (c *clusteredStorage) Create(ctx context.Context, key string, obj, out runtime.Object, ttl uint64) error {
+	store, key, err := c.storeAndKey(ctx, key)
+	if err != nil {
+		return err
+	}
+	return store.Create(ctx, key, obj, out, ttl)
+}
+
+func (c *clusteredStorage) Delete(ctx context.Context, key string, out runtime.Object, preconditions *storage.Preconditions, validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object, opts storage.DeleteOptions) error {
+	store, key, err := c.storeAndKey(ctx, key)
+	if err != nil {
+		return err
+	}
+	return store.Delete(ctx, key, out, preconditions, validateDeletion, cachedExistingObject, opts)
+}
+
+func (c *clusteredStorage) Watch(ctx context.Context, key string, opts storage.ListOptions) (watch.Interface, error) {
+	store, key, err := c.storeAndKey(ctx, key)
 	if err != nil {
 		return nil, err
 	}
+	return store.Watch(ctx, key, opts)
+}
+
+func (c *clusteredStorage) Get(ctx context.Context, key string, opts storage.GetOptions, objPtr runtime.Object) error {
+	store, key, err := c.storeAndKey(ctx, key)
+	if err != nil {
+		return err
+	}
+	return store.Get(ctx, key, opts, objPtr)
+}
+
+func (c *clusteredStorage) GetList(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
+	store, key, err := c.storeAndKey(ctx, key)
+	if err != nil {
+		return err
+	}
+	return store.GetList(ctx, key, opts, listObj)
+}
+
+func (c *clusteredStorage) GuaranteedUpdate(ctx context.Context, key string, destination runtime.Object, ignoreNotFound bool, precond *storage.Preconditions, tryUpdate storage.UpdateFunc, cachedExistingObject runtime.Object) error {
+	store, key, err := c.storeAndKey(ctx, key)
+	if err != nil {
+		return err
+	}
+	return store.GuaranteedUpdate(ctx, key, destination, ignoreNotFound, precond, tryUpdate, cachedExistingObject)
+}
+
+func (c *clusteredStorage) Stats(ctx context.Context) (storage.Stats, error) {
+	store, _, err := c.storeAndKey(ctx, "")
+	if err != nil {
+		return storage.Stats{}, err
+	}
+	return store.Stats(ctx)
+}
+
+func (c *clusteredStorage) ReadinessCheck() error {
+	store, err := c.storeForCluster(c.defaultCluster())
+	if err != nil {
+		return err
+	}
+	return store.ReadinessCheck()
+}
+
+func (c *clusteredStorage) RequestWatchProgress(ctx context.Context) error {
+	store, _, err := c.storeAndKey(ctx, "")
+	if err != nil {
+		return err
+	}
+	return store.RequestWatchProgress(ctx)
+}
+
+func (c *clusteredStorage) GetCurrentResourceVersion(ctx context.Context) (uint64, error) {
+	store, _, err := c.storeAndKey(ctx, "")
+	if err != nil {
+		return 0, err
+	}
+	return store.GetCurrentResourceVersion(ctx)
+}
+
+func (c *clusteredStorage) SetKeysFunc(keysFunc storage.KeysFunc) {
+	store, err := c.storeForCluster(c.defaultCluster())
+	if err != nil {
+		return
+	}
+	store.SetKeysFunc(keysFunc)
+}
+
+func (c *clusteredStorage) CompactRevision() int64 {
+	store, err := c.storeForCluster(c.defaultCluster())
+	if err != nil {
+		return 0
+	}
+	return store.CompactRevision()
+}
+
+func (c *clusteredStorage) destroy() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, destroy := range c.destroys {
+		destroy()
+	}
+}
+
+func (c *clusteredStorage) storeAndKey(ctx context.Context, key string) (storage.Interface, string, error) {
 	cid, all, _ := FromContext(ctx)
-	if all || cid == "" {
-		return wi, nil
-	}
-	ann := w.Options.ClusterAnnotationKey
-	return watch.Filter(wi, func(in watch.Event) (watch.Event, bool) {
-		if in.Object == nil {
-			return in, true
-		}
-		if matchesCluster(in.Object, cid, ann) {
-			return in, true
-		}
-		return in, false
-	}), nil
-}
-
-func (w keyRewritingStorage) GuaranteedUpdate(ctx context.Context, key string, destination runtime.Object, ignoreNotFound bool, precond *storage.Preconditions, tryUpdate storage.UpdateFunc, cachedExistingObject runtime.Object) error {
-	key = w.rewriteKey(ctx, key, false)
-	return w.Interface.GuaranteedUpdate(ctx, key, destination, ignoreNotFound, precond, tryUpdate, cachedExistingObject)
-}
-
-func (w keyRewritingStorage) rewriteKey(ctx context.Context, key string, isPrefix bool) string {
-	cid, _, _ := FromContext(ctx)
-	if cid == "" {
-		cid = w.Options.DefaultCluster
+	if all {
+		store, err := c.globalStore()
+		return store, key, err
 	}
 	if cid == "" {
-		cid = DefaultClusterName
+		cid = c.defaultCluster()
 	}
-	if isPrefix {
-		// KindRoot strategy: keep kind-root prefixes unchanged for shared watches
-		return key
+	store, err := c.storeForCluster(cid)
+	if err != nil {
+		return nil, key, err
 	}
-	return injectClusterSegment(key, cid, w.Layout)
+	return store, c.rewriteKey(cid, key), nil
+}
+
+func (c *clusteredStorage) defaultCluster() string {
+	if c.options.DefaultCluster != "" {
+		return c.options.DefaultCluster
+	}
+	return DefaultClusterName
+}
+
+func (c *clusteredStorage) rewriteKey(cluster, key string) string {
+	return injectClusterSegment(key, cluster, c.layout)
+}
+
+func (c *clusteredStorage) storeForCluster(cluster string) (storage.Interface, error) {
+	cluster = strings.TrimSpace(cluster)
+	if cluster == "" {
+		cluster = c.defaultCluster()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if store, ok := c.stores[cluster]; ok {
+		return store, nil
+	}
+	cfg := *c.config
+	clusterPrefix := injectClusterSegment(c.resourcePrefix, cluster, c.layout)
+	keyFunc := func(obj runtime.Object) (string, error) {
+		key, err := c.keyFunc(obj)
+		if err != nil {
+			return "", err
+		}
+		return injectClusterSegment(key, cluster, c.layout), nil
+	}
+	store, destroy, err := c.base(&cfg, clusterPrefix, keyFunc, c.newFunc, c.newListFunc, c.getAttrsFunc, c.trigger, c.indexers)
+	if err != nil {
+		return nil, err
+	}
+	c.stores[cluster] = store
+	c.destroys[cluster] = destroy
+	return store, nil
+}
+
+func (c *clusteredStorage) globalStore() (storage.Interface, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.global != nil {
+		return c.global, nil
+	}
+	cfg := *c.config
+	store, destroy, err := c.base(&cfg, c.resourcePrefix, c.keyFunc, c.newFunc, c.newListFunc, c.getAttrsFunc, c.trigger, c.indexers)
+	if err != nil {
+		return nil, err
+	}
+	c.global = store
+	c.destroys["__global__"] = destroy
+	return store, nil
 }
 
 func injectClusterSegment(key, cluster string, layout KeyLayout) string {
