@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/admission"
+	namespaceplugin "k8s.io/apiserver/pkg/admission/plugin/namespace/lifecycle"
 	"k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/pkg/util/webhook"
 	aggregatorapiserver "k8s.io/kube-aggregator/pkg/apiserver"
@@ -36,6 +37,7 @@ import (
 	"github.com/kplane-dev/apiserver/cmd/apiserver/app/options"
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
 	mca "github.com/kplane-dev/apiserver/pkg/multicluster/admission"
+	mcnsl "github.com/kplane-dev/apiserver/pkg/multicluster/admission/namespace"
 	mcwh "github.com/kplane-dev/apiserver/pkg/multicluster/admission/webhook"
 	mcauth "github.com/kplane-dev/apiserver/pkg/multicluster/auth"
 )
@@ -92,6 +94,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 			opts.Admission.GenericAdmission.DisablePlugins,
 			"MutatingAdmissionWebhook",
 			"ValidatingAdmissionWebhook",
+			namespaceplugin.PluginName,
 		)
 	}
 
@@ -139,12 +142,20 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		genericConfig.RESTOptionsGetter = mc.RESTOptionsDecorator{Delegate: genericConfig.RESTOptionsGetter, Options: mcOpts}
 	}
 
-	// Wrap admission: mutating first, then existing chain, then validating
+	// Cluster-aware namespace lifecycle (per-cluster client + informer).
+	mcNamespaceMgr := mcnsl.NewManager(mcnsl.Options{
+		BaseLoopbackClientConfig: genericConfig.LoopbackClientConfig,
+		PathPrefix:               mcOpts.PathPrefix,
+		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
+	})
+	mcNamespaceLifecycle := mcnsl.NewLifecycle(mcOpts, mcNamespaceMgr)
+
+	// Wrap admission: mutating first, namespace lifecycle, then existing chain, then validating
 	{
 		mut := mca.NewMutating(mcOpts)
 		val := mca.NewValidating(mcOpts)
 		base := genericConfig.AdmissionControl
-		chain := []admission.Interface{mut}
+		chain := []admission.Interface{mut, mcNamespaceLifecycle}
 		if base != nil {
 			chain = append(chain, base)
 		}
@@ -181,7 +192,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		mut := mca.NewMutating(mcOpts)
 		val := mca.NewValidating(mcOpts)
 		base := c.KubeAPIs.ControlPlane.Generic.AdmissionControl
-		chain := []admission.Interface{mut, mcMutatingWebhook}
+		chain := []admission.Interface{mut, mcNamespaceLifecycle, mcMutatingWebhook}
 		if base != nil {
 			chain = append(chain, base)
 		}
@@ -204,7 +215,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		mut := mca.NewMutating(mcOpts)
 		val := mca.NewValidating(mcOpts)
 		base := apiExtensions.GenericConfig.AdmissionControl
-		chain := []admission.Interface{mut, mcMutatingWebhook}
+		chain := []admission.Interface{mut, mcNamespaceLifecycle, mcMutatingWebhook}
 		if base != nil {
 			chain = append(chain, base)
 		}
@@ -227,7 +238,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		mut := mca.NewMutating(mcOpts)
 		val := mca.NewValidating(mcOpts)
 		base := aggregator.GenericConfig.AdmissionControl
-		chain := []admission.Interface{mut, mcMutatingWebhook}
+		chain := []admission.Interface{mut, mcNamespaceLifecycle, mcMutatingWebhook}
 		if base != nil {
 			chain = append(chain, base)
 		}
