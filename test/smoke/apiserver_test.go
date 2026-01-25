@@ -21,6 +21,10 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type testAPIServer struct {
@@ -28,6 +32,7 @@ type testAPIServer struct {
 	binPath string
 	port    int
 	tmpDir  string
+	root    string
 
 	cmd    *exec.Cmd
 	cancel context.CancelFunc
@@ -106,7 +111,16 @@ func mustWriteTokenFile(t *testing.T, path string) string {
 	return path
 }
 
+type apiserverOptions struct {
+	rootCluster string
+	extraArgs   []string
+}
+
 func startAPIServer(t *testing.T, etcdEndpoints string) *testAPIServer {
+	return startAPIServerWithOptions(t, etcdEndpoints, apiserverOptions{})
+}
+
+func startAPIServerWithOptions(t *testing.T, etcdEndpoints string, opts apiserverOptions) *testAPIServer {
 	t.Helper()
 	if strings.TrimSpace(etcdEndpoints) == "" {
 		t.Skip("ETCD_ENDPOINTS is not set; skipping integration smoke tests")
@@ -124,6 +138,10 @@ func startAPIServer(t *testing.T, etcdEndpoints string) *testAPIServer {
 		tmpDir:  tmp,
 		cancel:  cancel,
 	}
+	if opts.rootCluster == "" {
+		opts.rootCluster = mc.DefaultClusterName
+	}
+	s.root = opts.rootCluster
 
 	args := []string{
 		"--etcd-servers=" + etcdEndpoints,
@@ -140,6 +158,12 @@ func startAPIServer(t *testing.T, etcdEndpoints string) *testAPIServer {
 		"--service-account-key-file=" + filepath.Join(tmp, "sa.key"),
 		// reduce noise + make startup faster for tests
 		"--v=2",
+	}
+	if opts.rootCluster != mc.DefaultClusterName {
+		args = append(args, "--root-control-plane-name="+opts.rootCluster)
+	}
+	if len(opts.extraArgs) > 0 {
+		args = append(args, opts.extraArgs...)
 	}
 
 	cmd := exec.CommandContext(ctx, bin, args...)
@@ -162,7 +186,7 @@ func startAPIServer(t *testing.T, etcdEndpoints string) *testAPIServer {
 	})
 
 	// Wait for readiness on root cluster
-	s.waitReady(t, "root")
+	s.waitReady(t, s.root)
 
 	return s
 }
@@ -265,4 +289,22 @@ func isConnRefused(err error) bool {
 		return true
 	}
 	return strings.Contains(err.Error(), "connection refused")
+}
+
+func TestRootControlPlaneNameOverride(t *testing.T) {
+	etcd := os.Getenv("ETCD_ENDPOINTS")
+	s := startAPIServerWithOptions(t, etcd, apiserverOptions{rootCluster: "default"})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	cs := kubeClientForCluster(t, s, s.root)
+	cmName := "cm-" + randSuffix(4)
+	_, err := cs.CoreV1().ConfigMaps("default").Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: cmName},
+		Data:       map[string]string{"root": "ok"},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create configmap in root cluster %q: %v", s.root, err)
+	}
 }
