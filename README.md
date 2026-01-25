@@ -31,6 +31,34 @@ Probe readiness (self-signed TLS; skip verification in curl):
 curl -k https://127.0.0.1:6443/clusters/root/control-plane/readyz
 ```
 
+### Multicluster control planes
+Requests are scoped by path:
+`/clusters/{cluster}/control-plane/...`
+
+The **root control plane** is the default cluster that receives CLI flag
+configuration and is used for default routing when no cluster is specified.
+You can change its name with:
+```bash
+--root-control-plane-name=default
+```
+When changed, the readiness path becomes:
+```
+https://127.0.0.1:6443/clusters/default/control-plane/readyz
+```
+
+#### Webhooks
+Admission webhooks are scoped per control plane. For each cluster, the server
+creates a per-cluster webhook client/informer stack and resolves Services and
+EndpointSlices within that cluster only. This prevents webhook config and
+service discovery from leaking across clusters.
+
+#### Auth (authentication + authorization)
+Authentication and authorization are also per control plane. For each cluster,
+the server constructs authenticators/authorizers using per-cluster loopback
+clients and informers. This isolates RBAC data, service-account tokens, and
+TokenReview/SubjectAccessReview evaluations so clusters can operate alongside
+each other without sharing auth state.
+
 ### Docker image
 Build locally:
 ```bash
