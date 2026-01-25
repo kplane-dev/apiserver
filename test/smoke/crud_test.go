@@ -28,7 +28,7 @@ func TestCRUD_RandomizedAcrossClusters(t *testing.T) {
 	defer cancel()
 
 	clusters := []string{
-		"root",
+		s.root,
 		"c-" + randSuffix(3),
 		"c-" + randSuffix(3),
 	}

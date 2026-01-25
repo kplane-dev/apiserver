@@ -180,6 +180,9 @@ type PerClusterWatch struct{}
 func (PerClusterWatch) WatchPrefixes(ctx context.Context, layout KeyLayout, gr GroupResource) ([]string, error) {
 	cid, _, _ := FromContext(ctx)
 	if cid == "" {
+		cid = layout.Options.DefaultCluster
+	}
+	if cid == "" {
 		cid = DefaultClusterName
 	}
 	return []string{layout.PerClusterRoot(cid, gr)}, nil

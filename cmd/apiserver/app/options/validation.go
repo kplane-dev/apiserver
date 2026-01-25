@@ -108,6 +108,17 @@ func validateServiceNodePort(options Extra) []error {
 	return errs
 }
 
+func validateRootControlPlaneName(name string) []error {
+	var errs []error
+	if strings.TrimSpace(name) == "" {
+		errs = append(errs, fmt.Errorf("--root-control-plane-name must not be empty"))
+	}
+	if strings.Contains(name, "/") {
+		errs = append(errs, fmt.Errorf("--root-control-plane-name must not contain '/'"))
+	}
+	return errs
+}
+
 func validatePublicIPServiceClusterIPRangeIPFamilies(extra Extra, generic genericoptions.ServerRunOptions) []error {
 	// The "kubernetes.default" Service is SingleStack based on the configured ServiceIPRange.
 	// If the bootstrap controller reconcile the kubernetes.default Service and Endpoints, it must
@@ -134,6 +145,7 @@ func (s CompletedOptions) Validate() []error {
 	errs = append(errs, s.CompletedOptions.Validate()...)
 	errs = append(errs, validateClusterIPFlags(s.Extra)...)
 	errs = append(errs, validateServiceNodePort(s.Extra)...)
+	errs = append(errs, validateRootControlPlaneName(s.RootControlPlaneName)...)
 	errs = append(errs, validatePublicIPServiceClusterIPRangeIPFamilies(s.Extra, *s.GenericServerRunOptions)...)
 
 	if s.MasterCount <= 0 {

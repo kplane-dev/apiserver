@@ -21,6 +21,7 @@ import (
 
 	apiextensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/pkg/util/webhook"
@@ -36,6 +37,7 @@ import (
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
 	mca "github.com/kplane-dev/apiserver/pkg/multicluster/admission"
 	mcwh "github.com/kplane-dev/apiserver/pkg/multicluster/admission/webhook"
+	mcauth "github.com/kplane-dev/apiserver/pkg/multicluster/auth"
 )
 
 type Config struct {
@@ -106,9 +108,30 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	// Install multicluster request routing early in the handler chain
 	mcOpts := mc.DefaultOptions
 	mcOpts.EtcdPrefix = storageFactory.StorageConfig.Prefix
+	if opts.RootControlPlaneName != "" {
+		mcOpts.DefaultCluster = opts.RootControlPlaneName
+	}
 	genericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
 		return mc.WithClusterRouting(server.DefaultBuildHandlerChain(h, conf), ex, mcOpts)
+	}
+
+	authManager := mcauth.NewManager(wait.ContextForChannel(genericConfig.DrainedNotify()), mcauth.Options{
+		BaseLoopbackClientConfig: genericConfig.LoopbackClientConfig,
+		PathPrefix:               mcOpts.PathPrefix,
+		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
+		Authentication:           opts.Authentication,
+		Authorization:            opts.Authorization,
+		EgressSelector:           genericConfig.EgressSelector,
+		APIServerID:              genericConfig.APIServerID,
+	})
+	if genericConfig.Authentication.Authenticator != nil {
+		genericConfig.Authentication.Authenticator = mcauth.NewClusterAuthenticator(mcOpts.DefaultCluster, genericConfig.Authentication.Authenticator, authManager)
+	}
+	if genericConfig.Authorization.Authorizer != nil {
+		clusterAuthorizer := mcauth.NewClusterAuthorizer(mcOpts.DefaultCluster, genericConfig.Authorization.Authorizer, genericConfig.RuleResolver, authManager)
+		genericConfig.Authorization.Authorizer = clusterAuthorizer
+		genericConfig.RuleResolver = clusterAuthorizer
 	}
 
 	// Decorate storage to inject cluster-aware key rewriting and filtering

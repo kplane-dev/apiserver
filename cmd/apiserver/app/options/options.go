@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
 	v1 "k8s.io/api/core/v1"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	cliflag "k8s.io/component-base/cli/flag"
@@ -46,6 +47,7 @@ type Extra struct {
 	AllowPrivileged           bool
 	KubeletConfig             kubeletclient.KubeletClientConfig
 	KubernetesServiceNodePort int
+	RootControlPlaneName      string
 	// ServiceClusterIPRange is mapped to input provided by user
 	ServiceClusterIPRanges string
 	// PrimaryServiceClusterIPRange and SecondaryServiceClusterIPRange are the results
@@ -88,6 +90,7 @@ func NewServerRunOptions() *ServerRunOptions {
 			},
 			ServiceNodePortRange: kubeoptions.DefaultServiceNodePortRange,
 			MasterCount:          1,
+			RootControlPlaneName: mc.DefaultClusterName,
 		},
 	}
 
@@ -102,6 +105,10 @@ func (s *ServerRunOptions) Flags() (fss cliflag.NamedFlagSets) {
 
 	// Note: the weird ""+ in below lines seems to be the only way to get gofmt to
 	// arrange these text blocks sensibly. Grrr.
+	mcfs := fss.FlagSet("multicluster")
+	mcfs.StringVar(&s.RootControlPlaneName, "root-control-plane-name", s.RootControlPlaneName,
+		"Name of the root control plane that receives CLI flag configuration and is used for default cluster routing.")
+
 	fs := fss.FlagSet("misc")
 
 	fs.BoolVar(&s.AllowPrivileged, "allow-privileged", s.AllowPrivileged,

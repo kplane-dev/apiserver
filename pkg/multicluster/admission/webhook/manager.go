@@ -1,15 +1,15 @@
 package webhook
 
 import (
-	"net/url"
 	"reflect"
-	"strings"
 	"sync"
 
 	webhookutil "k8s.io/apiserver/pkg/util/webhook"
 	clientgoinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+
+	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
 )
 
 type Options struct {
@@ -70,7 +70,10 @@ func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
 	}
 
 	cfg := rest.CopyConfig(m.opts.BaseLoopbackClientConfig)
-	host, err := withClusterPrefix(cfg.Host, m.opts.PathPrefix, clusterID, m.opts.ControlPlaneSegment)
+	host, err := mc.ClusterHost(cfg.Host, mc.Options{
+		PathPrefix:          m.opts.PathPrefix,
+		ControlPlaneSegment: m.opts.ControlPlaneSegment,
+	}, clusterID)
 	if err != nil {
 		return nil, err
 	}
@@ -122,29 +125,6 @@ func allSynced(m map[reflect.Type]bool) bool {
 		}
 	}
 	return true
-}
-
-func withClusterPrefix(host, pathPrefix, clusterID, controlPlaneSegment string) (string, error) {
-	u, err := url.Parse(host)
-	if err != nil {
-		return "", err
-	}
-	pp := pathPrefix
-	if pp == "" {
-		pp = "/clusters/"
-	}
-	seg := controlPlaneSegment
-	if seg == "" {
-		seg = "control-plane"
-	}
-	// ensure pp ends with "/"
-	if !strings.HasSuffix(pp, "/") {
-		pp = pp + "/"
-	}
-	// join onto existing path
-	basePath := strings.TrimRight(u.Path, "/")
-	u.Path = basePath + pp + clusterID + "/" + seg
-	return u.String(), nil
 }
 
 // StopCluster is test-oriented cleanup; production can leave informers running.

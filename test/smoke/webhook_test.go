@@ -157,7 +157,7 @@ func TestWebhook_ServiceBacked_MulticlusterScoping(t *testing.T) {
 	// Pick a non-root cluster to validate the suspected bug.
 	clusterA := "c-" + randSuffix(3)
 	clusterB := "c-" + randSuffix(3)
-	root := "root"
+	root := s.root
 
 	csA := kubeClientForCluster(t, s, clusterA)
 	csB := kubeClientForCluster(t, s, clusterB)
