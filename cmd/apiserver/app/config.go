@@ -272,6 +272,10 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 }
 
 func decorateRESTOptionsGetter(server string, getter generic.RESTOptionsGetter, opts mc.Options) generic.RESTOptionsGetter {
+	if _, ok := getter.(mc.RESTOptionsDecorator); ok {
+		klog.Infof("mc.restOptionsGetter server=%s alreadyDecorated=true", server)
+		return getter
+	}
 	opts.ServerName = server
 	decorated := mc.RESTOptionsDecorator{Delegate: getter, Options: opts}
 	klog.Infof("mc.restOptionsGetter server=%s decorated=%t", server, true)

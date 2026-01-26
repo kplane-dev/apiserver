@@ -50,8 +50,8 @@ func (v *Validating) Validate(ctx context.Context, a apiserveradmission.Attribut
 		if err != nil {
 			return nil
 		}
-		if cid := acc.GetAnnotations()[key]; cid != reqCID {
-			return fmt.Errorf("cluster annotation %q=%q must match request cluster %q", key, cid, reqCID)
+		if cid := acc.GetLabels()[key]; cid != reqCID {
+			return fmt.Errorf("cluster label %q=%q must match request cluster %q", key, cid, reqCID)
 		}
 		return nil
 	}
@@ -67,8 +67,8 @@ func (v *Validating) Validate(ctx context.Context, a apiserveradmission.Attribut
 		if err1 != nil || err2 != nil {
 			return nil
 		}
-		oldCID := oldAcc.GetAnnotations()[key]
-		newCID := newAcc.GetAnnotations()[key]
+		oldCID := oldAcc.GetLabels()[key]
+		newCID := newAcc.GetLabels()[key]
 		if (oldCID != "" && oldCID != reqCID) || (newCID != "" && newCID != oldCID) {
 			return fmt.Errorf("cross-cluster updates are forbidden (old=%q new=%q request=%q)", oldCID, newCID, reqCID)
 		}

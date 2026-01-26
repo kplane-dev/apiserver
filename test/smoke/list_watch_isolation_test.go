@@ -153,3 +153,82 @@ func TestListWatchIsolationAcrossClusters(t *testing.T) {
 		cmBOnly:  "b",
 	})
 }
+
+func TestListWatchReturnsObjectsInCluster(t *testing.T) {
+	etcd := os.Getenv("ETCD_ENDPOINTS")
+	s := startAPIServer(t, etcd)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	clusterID := "c-" + randSuffix(3)
+	ns := "ns-" + randSuffix(4)
+
+	cs := kubeClientForCluster(t, s, clusterID)
+
+	_, err := cs.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("cluster=%s create namespace: %v", clusterID, err)
+	}
+
+	cmName := "cm-" + randSuffix(4)
+	_, err = cs.CoreV1().ConfigMaps(ns).Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: cmName},
+		Data:       map[string]string{"ok": "true"},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("cluster=%s create configmap: %v", clusterID, err)
+	}
+
+	list, err := cs.CoreV1().ConfigMaps(ns).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("cluster=%s list configmaps: %v", clusterID, err)
+	}
+	found := false
+	for _, cm := range list.Items {
+		if cm.Name == cmName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("cluster=%s list missing configmap %s\nlogs:\n%s", clusterID, cmName, s.logs())
+	}
+
+	watchCtx, watchCancel := context.WithCancel(ctx)
+	defer watchCancel()
+	watcher, err := cs.CoreV1().ConfigMaps(ns).Watch(watchCtx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("cluster=%s watch configmaps: %v", clusterID, err)
+	}
+	defer watcher.Stop()
+
+	cmName2 := "cm-" + randSuffix(4)
+	_, err = cs.CoreV1().ConfigMaps(ns).Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: cmName2},
+		Data:       map[string]string{"ok": "true"},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("cluster=%s create configmap 2: %v", clusterID, err)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case event := <-watcher.ResultChan():
+			if event.Object == nil {
+				continue
+			}
+			if event.Type != watch.Added {
+				continue
+			}
+			cm := event.Object.(*corev1.ConfigMap)
+			if cm.Name == cmName2 {
+				return
+			}
+			// Ignore initial events for existing objects.
+		case <-deadline:
+			t.Fatalf("cluster=%s timed out waiting for watch event\nlogs:\n%s", clusterID, s.logs())
+		}
+	}
+}

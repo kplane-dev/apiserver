@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
@@ -41,6 +44,7 @@ var (
 		Name: "mc_storage_base_decorator_total",
 		Help: "Number of base storage decorator invocations by server and resource prefix.",
 	}, []string{"server", "resourcePrefix"})
+	debugStoreAndKey = os.Getenv("MC_STOREANDKEY_DEBUG") == "1"
 )
 
 func init() {
@@ -270,9 +274,23 @@ func (c *clusteredStorage) storeAndKey(ctx context.Context, key string) (storage
 		return nil, key, err
 	}
 	if all {
-		return store, c.kindRootPrefix(), nil
+		rewritten := c.kindRootPrefix()
+		fullKey := strings.TrimSuffix(c.config.Prefix, "/") + "/" + strings.TrimPrefix(rewritten, "/")
+		if debugStoreAndKey {
+			fmt.Fprintf(os.Stderr, "mc.storeAndKey all=true store=%T/%p resourcePrefix=%s key=%s cid=%s rewritten=%s etcdPrefix=%s fullKey=%s\n",
+				store, store, c.resourcePrefix, key, cid, rewritten, c.config.Prefix, fullKey,
+			)
+		}
+		return store, rewritten, nil
 	}
-	return store, c.rewriteKey(cid, key), nil
+	rewritten := c.rewriteKey(cid, key)
+	fullKey := strings.TrimSuffix(c.config.Prefix, "/") + "/" + strings.TrimPrefix(rewritten, "/")
+	if debugStoreAndKey {
+		fmt.Fprintf(os.Stderr, "mc.storeAndKey all=false store=%T/%p resourcePrefix=%s key=%s cid=%s rewritten=%s etcdPrefix=%s fullKey=%s\n",
+			store, store, c.resourcePrefix, key, cid, rewritten, c.config.Prefix, fullKey,
+		)
+	}
+	return store, rewritten, nil
 }
 
 func (c *clusteredStorage) defaultCluster() string {
@@ -280,6 +298,24 @@ func (c *clusteredStorage) defaultCluster() string {
 		return c.options.DefaultCluster
 	}
 	return DefaultClusterName
+}
+
+func (c *clusteredStorage) clusterFromObject(obj runtime.Object) string {
+	if obj == nil {
+		return c.defaultCluster()
+	}
+	acc, err := meta.Accessor(obj)
+	if err != nil {
+		return c.defaultCluster()
+	}
+	key := c.options.ClusterAnnotationKey
+	if key == "" {
+		key = DefaultClusterAnnotation
+	}
+	if cid := acc.GetLabels()[key]; cid != "" {
+		return cid
+	}
+	return c.defaultCluster()
 }
 
 func (c *clusteredStorage) rewriteKey(cluster, key string) string {
@@ -319,16 +355,17 @@ func (c *clusteredStorage) ensureStore() (storage.Interface, error) {
 	stack := debug.Stack()
 	stackHash := sha256.Sum256(stack)
 	ensureStoreTotal.WithLabelValues(server, c.resourcePrefix).Inc()
-	klog.Infof("mc.ensureStore #%d server=%s resourcePrefix=%s kindRoot=%s stack=%s",
-		seq, server, c.resourcePrefix, kindRootPrefix, hex.EncodeToString(stackHash[:8]),
+	klog.Infof("mc.ensureStore #%d server=%s resourcePrefix=%s kindRoot=%s etcdPrefix=%s stack=%s",
+		seq, server, c.resourcePrefix, kindRootPrefix, cfg.Prefix, hex.EncodeToString(stackHash[:8]),
 	)
 	keyFunc := func(obj runtime.Object) (string, error) {
 		key, err := c.keyFunc(obj)
 		if err != nil {
 			return "", err
 		}
-		// No context here: use the default cluster to avoid annotation-driven key churn.
-		return c.rewriteKey(c.defaultCluster(), key), nil
+		// The watchcache indexes by keyFunc output, so we must include the cluster
+		// derived from the stored object to avoid cross-cluster list/watch misses.
+		return c.rewriteKey(c.clusterFromObject(obj), key), nil
 	}
 	store, destroy, err := c.base(&cfg, kindRootPrefix, keyFunc, c.newFunc, c.newListFunc, c.getAttrsFunc, c.trigger, c.indexers)
 	if err != nil {
