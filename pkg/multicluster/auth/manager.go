@@ -30,6 +30,7 @@ type Options struct {
 	Authorization            *kubeoptions.BuiltInAuthorizationOptions
 	EgressSelector           *egressselector.EgressSelector
 	APIServerID              string
+	ClientPool               *mc.ClientPool
 }
 
 // Manager builds per-cluster authenticators and authorizers on demand.
@@ -59,6 +60,9 @@ type clusterEnv struct {
 func NewManager(ctx context.Context, opts Options) *Manager {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if opts.ClientPool == nil && opts.BaseLoopbackClientConfig != nil {
+		opts.ClientPool = mc.NewClientPool(opts.BaseLoopbackClientConfig, opts.PathPrefix, opts.ControlPlaneSegment)
 	}
 	return &Manager{
 		ctx:      ctx,
@@ -110,23 +114,12 @@ func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
 		return env, nil
 	}
 
-	if m.opts.BaseLoopbackClientConfig == nil {
+	if m.opts.ClientPool == nil {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("loopback client config is required for cluster auth")
+		return nil, fmt.Errorf("loopback client pool is required for cluster auth")
 	}
 
-	cfg := rest.CopyConfig(m.opts.BaseLoopbackClientConfig)
-	host, err := mc.ClusterHost(cfg.Host, mc.Options{
-		PathPrefix:          m.opts.PathPrefix,
-		ControlPlaneSegment: m.opts.ControlPlaneSegment,
-	}, clusterID)
-	if err != nil {
-		m.mu.Unlock()
-		return nil, err
-	}
-	cfg.Host = host
-
-	cs, err := kubernetes.NewForConfig(cfg)
+	cs, err := m.opts.ClientPool.KubeClientForCluster(clusterID)
 	if err != nil {
 		m.mu.Unlock()
 		return nil, err
