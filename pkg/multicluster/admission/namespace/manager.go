@@ -21,6 +21,9 @@ type Options struct {
 
 	// ClientPool caches per-cluster loopback clients.
 	ClientPool *mc.ClientPool
+
+	// InformerPool shares informer factories across managers per cluster.
+	InformerPool *mc.InformerPool
 }
 
 type Manager struct {
@@ -31,7 +34,7 @@ type Manager struct {
 }
 
 type clusterEnv struct {
-	stopCh chan struct{}
+	stopCh <-chan struct{}
 	cid    string
 
 	clientset kubernetes.Interface
@@ -41,6 +44,9 @@ type clusterEnv struct {
 func NewManager(opts Options) *Manager {
 	if opts.ClientPool == nil && opts.BaseLoopbackClientConfig != nil {
 		opts.ClientPool = mc.NewClientPool(opts.BaseLoopbackClientConfig, opts.PathPrefix, opts.ControlPlaneSegment)
+	}
+	if opts.InformerPool == nil && opts.ClientPool != nil {
+		opts.InformerPool = mc.NewInformerPoolFromClientPool(opts.ClientPool, 0, nil)
 	}
 	return &Manager{
 		opts:     opts,
@@ -56,23 +62,23 @@ func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
 		return e, nil
 	}
 
-	cs, err := m.opts.ClientPool.KubeClientForCluster(clusterID)
+	if m.opts.InformerPool == nil {
+		return nil, mc.ErrMissingClientFactory
+	}
+	cs, inf, stopCh, err := m.opts.InformerPool.Get(clusterID)
 	if err != nil {
 		return nil, err
 	}
-	inf := informers.NewSharedInformerFactory(cs, 0)
 
 	e := &clusterEnv{
 		cid:       clusterID,
-		stopCh:    make(chan struct{}),
+		stopCh:    stopCh,
 		clientset: cs,
 		informers: inf,
 	}
 
 	// Warm the namespaces informer (used by NamespaceLifecycle).
 	_ = inf.Core().V1().Namespaces().Informer()
-	inf.Start(e.stopCh)
-
 	m.clusters[clusterID] = e
 	return e, nil
 }

@@ -264,7 +264,9 @@ func (a *Webhook) Dispatch(ctx context.Context, attr admission.Attributes, o adm
 		return nil
 	}
 	if !a.WaitForReady() {
-		return admission.NewForbidden(attr, fmt.Errorf("not yet ready to handle request"))
+		// Fail-open for multicluster webhook caches to avoid blocking cluster bootstraps.
+		klog.V(2).Infof("Webhook caches not ready; skipping webhook dispatch for %s/%s", attr.GetResource().Resource, attr.GetName())
+		return nil
 	}
 	hooks := a.hookSource.Webhooks()
 	return a.dispatcher.Dispatch(ctx, attr, o, hooks)

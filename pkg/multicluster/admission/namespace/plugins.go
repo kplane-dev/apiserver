@@ -69,6 +69,8 @@ func (p *LifecyclePlugin) forCluster(ctx context.Context) *upstream.Lifecycle {
 	}
 	plugin.SetExternalKubeClientSet(env.clientset)
 	plugin.SetExternalKubeInformerFactory(env.informers)
+	// Avoid deadlock on initial cache sync for per-cluster namespace lifecycle.
+	plugin.SetReadyFunc(func() bool { return true })
 	if err := plugin.ValidateInitialization(); err != nil {
 		panic(err)
 	}

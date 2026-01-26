@@ -117,6 +117,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		mcOpts.DefaultCluster = opts.RootControlPlaneName
 	}
 	clientPool := mc.NewClientPool(genericConfig.LoopbackClientConfig, mcOpts.PathPrefix, mcOpts.ControlPlaneSegment)
+	informerPool := mc.NewInformerPoolFromClientPool(clientPool, 0, genericConfig.DrainedNotify())
 	genericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
 		return mc.WithClusterRouting(server.DefaultBuildHandlerChain(h, conf), ex, mcOpts)
@@ -131,6 +132,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		EgressSelector:           genericConfig.EgressSelector,
 		APIServerID:              genericConfig.APIServerID,
 		ClientPool:               clientPool,
+		InformerPool:             informerPool,
 	})
 	if genericConfig.Authentication.Authenticator != nil {
 		genericConfig.Authentication.Authenticator = mcauth.NewClusterAuthenticator(mcOpts.DefaultCluster, genericConfig.Authentication.Authenticator, authManager)
@@ -152,6 +154,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		PathPrefix:               mcOpts.PathPrefix,
 		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
 		ClientPool:               clientPool,
+		InformerPool:             informerPool,
 	})
 	mcNamespaceLifecycle := mcnsl.NewLifecycle(mcOpts, mcNamespaceMgr)
 
@@ -194,6 +197,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
 		CelRuntime:               celRuntime,
 		ClientPool:               clientPool,
+		InformerPool:             informerPool,
 	})
 	mcMutatingWebhook := mcwh.NewMutating(mcOpts, mcWebhookMgr)
 	mcValidatingWebhook := mcwh.NewValidating(mcOpts, mcWebhookMgr)
