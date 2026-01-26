@@ -2,10 +2,13 @@ package multicluster
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
@@ -14,6 +17,10 @@ import (
 	"k8s.io/apiserver/pkg/storage/storagebackend"
 	"k8s.io/apiserver/pkg/storage/storagebackend/factory"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
+
+	"k8s.io/component-base/metrics"
+	"k8s.io/component-base/metrics/legacyregistry"
 )
 
 // RESTOptionsDecorator wraps the underlying getter to inject a decorator that
@@ -22,6 +29,22 @@ import (
 type RESTOptionsDecorator struct {
 	Delegate generic.RESTOptionsGetter
 	Options  Options
+}
+
+var (
+	ensureStoreSeq   uint64
+	ensureStoreTotal = metrics.NewCounterVec(&metrics.CounterOpts{
+		Name: "mc_storage_ensure_store_total",
+		Help: "Number of base stores created by the multicluster storage decorator.",
+	}, []string{"server", "resourcePrefix"})
+	baseDecoratorTotal = metrics.NewCounterVec(&metrics.CounterOpts{
+		Name: "mc_storage_base_decorator_total",
+		Help: "Number of base storage decorator invocations by server and resource prefix.",
+	}, []string{"server", "resourcePrefix"})
+)
+
+func init() {
+	legacyregistry.MustRegister(ensureStoreTotal, baseDecoratorTotal)
 }
 
 func (w RESTOptionsDecorator) GetRESTOptions(resource schema.GroupResource, example runtime.Object) (generic.RESTOptions, error) {
@@ -33,7 +56,7 @@ func (w RESTOptionsDecorator) GetRESTOptions(resource schema.GroupResource, exam
 	if base == nil {
 		base = generic.UndecoratedStorage
 	}
-	layout := KeyLayout{Options: w.Options}
+	base = wrapBaseDecorator(base, w.Options)
 	opts.Decorator = func(
 		config *storagebackend.ConfigForResource,
 		resourcePrefix string,
@@ -55,10 +78,30 @@ func (w RESTOptionsDecorator) GetRESTOptions(resource schema.GroupResource, exam
 			trigger,
 			indexers,
 			w.Options,
-			layout,
 		)
 	}
 	return opts, nil
+}
+
+func wrapBaseDecorator(base generic.StorageDecorator, opts Options) generic.StorageDecorator {
+	return func(
+		config *storagebackend.ConfigForResource,
+		resourcePrefix string,
+		keyFunc func(obj runtime.Object) (string, error),
+		newFunc func() runtime.Object,
+		newListFunc func() runtime.Object,
+		getAttrsFunc storage.AttrFunc,
+		trigger storage.IndexerFuncs,
+		indexers *cache.Indexers,
+	) (storage.Interface, factory.DestroyFunc, error) {
+		server := opts.ServerName
+		if server == "" {
+			server = "unknown"
+		}
+		baseDecoratorTotal.WithLabelValues(server, resourcePrefix).Inc()
+		klog.V(2).Infof("mc.baseDecorator server=%s resourcePrefix=%s", server, resourcePrefix)
+		return base(config, resourcePrefix, keyFunc, newFunc, newListFunc, getAttrsFunc, trigger, indexers)
+	}
 }
 
 type clusteredStorage struct {
@@ -72,12 +115,10 @@ type clusteredStorage struct {
 	trigger        storage.IndexerFuncs
 	indexers       *cache.Indexers
 	options        Options
-	layout         KeyLayout
 
-	mu       sync.Mutex
-	stores   map[string]storage.Interface
-	destroys map[string]factory.DestroyFunc
-	global   storage.Interface
+	mu        sync.Mutex
+	store     storage.Interface
+	destroyFn factory.DestroyFunc
 }
 
 func newClusteredStorage(
@@ -91,7 +132,6 @@ func newClusteredStorage(
 	trigger storage.IndexerFuncs,
 	indexers *cache.Indexers,
 	options Options,
-	layout KeyLayout,
 ) (storage.Interface, factory.DestroyFunc, error) {
 	cs := &clusteredStorage{
 		base:           base,
@@ -104,15 +144,12 @@ func newClusteredStorage(
 		trigger:        trigger,
 		indexers:       indexers,
 		options:        options,
-		layout:         layout,
-		stores:         map[string]storage.Interface{},
-		destroys:       map[string]factory.DestroyFunc{},
 	}
 	return cs, cs.destroy, nil
 }
 
 func (c *clusteredStorage) Versioner() storage.Versioner {
-	store, err := c.storeForCluster(c.defaultCluster())
+	store, err := c.ensureStore()
 	if err != nil {
 		return nil
 	}
@@ -176,7 +213,7 @@ func (c *clusteredStorage) Stats(ctx context.Context) (storage.Stats, error) {
 }
 
 func (c *clusteredStorage) ReadinessCheck() error {
-	store, err := c.storeForCluster(c.defaultCluster())
+	store, err := c.ensureStore()
 	if err != nil {
 		return err
 	}
@@ -200,7 +237,7 @@ func (c *clusteredStorage) GetCurrentResourceVersion(ctx context.Context) (uint6
 }
 
 func (c *clusteredStorage) SetKeysFunc(keysFunc storage.KeysFunc) {
-	store, err := c.storeForCluster(c.defaultCluster())
+	store, err := c.ensureStore()
 	if err != nil {
 		return
 	}
@@ -208,7 +245,7 @@ func (c *clusteredStorage) SetKeysFunc(keysFunc storage.KeysFunc) {
 }
 
 func (c *clusteredStorage) CompactRevision() int64 {
-	store, err := c.storeForCluster(c.defaultCluster())
+	store, err := c.ensureStore()
 	if err != nil {
 		return 0
 	}
@@ -218,23 +255,22 @@ func (c *clusteredStorage) CompactRevision() int64 {
 func (c *clusteredStorage) destroy() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, destroy := range c.destroys {
-		destroy()
+	if c.destroyFn != nil {
+		c.destroyFn()
 	}
 }
 
 func (c *clusteredStorage) storeAndKey(ctx context.Context, key string) (storage.Interface, string, error) {
 	cid, all, _ := FromContext(ctx)
-	if all {
-		store, err := c.globalStore()
-		return store, key, err
-	}
 	if cid == "" {
 		cid = c.defaultCluster()
 	}
-	store, err := c.storeForCluster(cid)
+	store, err := c.ensureStore()
 	if err != nil {
 		return nil, key, err
+	}
+	if all {
+		return store, c.kindRootPrefix(), nil
 	}
 	return store, c.rewriteKey(cid, key), nil
 }
@@ -247,125 +283,58 @@ func (c *clusteredStorage) defaultCluster() string {
 }
 
 func (c *clusteredStorage) rewriteKey(cluster, key string) string {
-	return injectClusterSegment(key, cluster, c.layout)
+	if cluster == "" {
+		cluster = DefaultClusterName
+	}
+	rp := strings.TrimSuffix(c.resourcePrefix, "/")
+	if key == "" {
+		return rp + "/clusters/" + cluster
+	}
+	if strings.HasPrefix(key, rp+"/clusters/") {
+		return key
+	}
+	if strings.HasPrefix(key, rp) {
+		return rp + "/clusters/" + cluster + strings.TrimPrefix(key, rp)
+	}
+	return key
 }
 
-func (c *clusteredStorage) storeForCluster(cluster string) (storage.Interface, error) {
-	cluster = strings.TrimSpace(cluster)
-	if cluster == "" {
-		cluster = c.defaultCluster()
-	}
+func (c *clusteredStorage) kindRootPrefix() string {
+	return strings.TrimSuffix(c.resourcePrefix, "/") + "/clusters"
+}
+
+func (c *clusteredStorage) ensureStore() (storage.Interface, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if store, ok := c.stores[cluster]; ok {
-		return store, nil
+	if c.store != nil {
+		return c.store, nil
 	}
 	cfg := *c.config
-	clusterPrefix := injectClusterSegment(c.resourcePrefix, cluster, c.layout)
+	kindRootPrefix := c.kindRootPrefix()
+	server := c.options.ServerName
+	if server == "" {
+		server = "unknown"
+	}
+	seq := atomic.AddUint64(&ensureStoreSeq, 1)
+	stack := debug.Stack()
+	stackHash := sha256.Sum256(stack)
+	ensureStoreTotal.WithLabelValues(server, c.resourcePrefix).Inc()
+	klog.Infof("mc.ensureStore #%d server=%s resourcePrefix=%s kindRoot=%s stack=%s",
+		seq, server, c.resourcePrefix, kindRootPrefix, hex.EncodeToString(stackHash[:8]),
+	)
 	keyFunc := func(obj runtime.Object) (string, error) {
 		key, err := c.keyFunc(obj)
 		if err != nil {
 			return "", err
 		}
-		return injectClusterSegment(key, cluster, c.layout), nil
+		// No context here: use the default cluster to avoid annotation-driven key churn.
+		return c.rewriteKey(c.defaultCluster(), key), nil
 	}
-	store, destroy, err := c.base(&cfg, clusterPrefix, keyFunc, c.newFunc, c.newListFunc, c.getAttrsFunc, c.trigger, c.indexers)
+	store, destroy, err := c.base(&cfg, kindRootPrefix, keyFunc, c.newFunc, c.newListFunc, c.getAttrsFunc, c.trigger, c.indexers)
 	if err != nil {
 		return nil, err
 	}
-	c.stores[cluster] = store
-	c.destroys[cluster] = destroy
+	c.store = store
+	c.destroyFn = destroy
 	return store, nil
-}
-
-func (c *clusteredStorage) globalStore() (storage.Interface, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.global != nil {
-		return c.global, nil
-	}
-	cfg := *c.config
-	store, destroy, err := c.base(&cfg, c.resourcePrefix, c.keyFunc, c.newFunc, c.newListFunc, c.getAttrsFunc, c.trigger, c.indexers)
-	if err != nil {
-		return nil, err
-	}
-	c.global = store
-	c.destroys["__global__"] = destroy
-	return store, nil
-}
-
-func injectClusterSegment(key, cluster string, layout KeyLayout) string {
-	if cluster == "" {
-		cluster = DefaultClusterName
-	}
-	leadingSlash := strings.HasPrefix(key, "/")
-	trimmed := strings.TrimPrefix(key, "/")
-	parts := strings.Split(trimmed, "/")
-	if len(parts) == 0 {
-		if leadingSlash {
-			return "/"
-		}
-		return key
-	}
-	// Compute position after kind-root: /<prefix>/<group?>/<resource>/... => insert after resource
-	resIdx := 0
-	p := layout.Options.EtcdPrefix
-	if p == "" {
-		p = DefaultEtcdPrefix
-	}
-	if parts[0] == strings.TrimPrefix(p, "/") { // starts with etcd prefix sans leading '/'
-		if len(parts) >= 3 && strings.Contains(parts[1], ".") {
-			resIdx = 2
-		} else {
-			resIdx = 1
-		}
-	} else if strings.Contains(parts[0], ".") {
-		resIdx = 1
-	} else {
-		resIdx = 0
-	}
-	if resIdx >= len(parts) {
-		resIdx = len(parts) - 1
-	}
-	insertPos := resIdx + 1
-	if insertPos < len(parts) && parts[insertPos] == cluster {
-		if leadingSlash {
-			return "/" + strings.Join(parts, "/")
-		}
-		return strings.Join(parts, "/")
-	}
-	newParts := append(append([]string{}, parts[:insertPos]...), append([]string{cluster}, parts[insertPos:]...)...)
-	if leadingSlash {
-		return "/" + strings.Join(newParts, "/")
-	}
-	return strings.Join(newParts, "/")
-}
-
-func matchesCluster(obj runtime.Object, cid, annotationKey string) bool {
-	if annotationKey == "" {
-		annotationKey = DefaultClusterAnnotation
-	}
-	acc, err := meta.Accessor(obj)
-	if err != nil {
-		return false
-	}
-	anns := acc.GetAnnotations()
-	if anns == nil {
-		return false
-	}
-	return anns[annotationKey] == cid
-}
-
-func filterListByCluster(listObj runtime.Object, cid, annotationKey string) error {
-	items, err := meta.ExtractList(listObj)
-	if err != nil {
-		return err
-	}
-	filtered := make([]runtime.Object, 0, len(items))
-	for _, it := range items {
-		if matchesCluster(it, cid, annotationKey) {
-			filtered = append(filtered, it)
-		}
-	}
-	return meta.SetList(listObj, filtered)
 }

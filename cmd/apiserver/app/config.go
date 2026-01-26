@@ -24,8 +24,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/admission"
 	namespaceplugin "k8s.io/apiserver/pkg/admission/plugin/namespace/lifecycle"
+	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/pkg/util/webhook"
+	"k8s.io/klog/v2"
 	aggregatorapiserver "k8s.io/kube-aggregator/pkg/apiserver"
 	aggregatorscheme "k8s.io/kube-aggregator/pkg/apiserver/scheme"
 
@@ -139,7 +141,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 
 	// Decorate storage to inject cluster-aware key rewriting and filtering
 	if genericConfig.RESTOptionsGetter != nil {
-		genericConfig.RESTOptionsGetter = mc.RESTOptionsDecorator{Delegate: genericConfig.RESTOptionsGetter, Options: mcOpts}
+		genericConfig.RESTOptionsGetter = decorateRESTOptionsGetter("controlplane", genericConfig.RESTOptionsGetter, mcOpts)
 	}
 
 	// Cluster-aware namespace lifecycle (per-cluster client + informer).
@@ -168,6 +170,9 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		return nil, err
 	}
 	c.KubeAPIs = kubeAPIs
+	if c.KubeAPIs.ControlPlane.Generic.RESTOptionsGetter != nil {
+		c.KubeAPIs.ControlPlane.Generic.RESTOptionsGetter = decorateRESTOptionsGetter("controlplane", c.KubeAPIs.ControlPlane.Generic.RESTOptionsGetter, mcOpts)
+	}
 
 	// Cluster-aware webhook admission (per-cluster clients + informers, no global cross-cluster view).
 	authWrapper := webhook.NewDefaultAuthenticationInfoResolverWrapper(
@@ -205,6 +210,9 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	if apiExtensions.GenericConfig.RESTOptionsGetter != nil {
+		apiExtensions.GenericConfig.RESTOptionsGetter = decorateRESTOptionsGetter("apiextensions", apiExtensions.GenericConfig.RESTOptionsGetter, mcOpts)
+	}
 	// Ensure CRDs are also routed through the multicluster handler
 	apiExtensions.GenericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
@@ -228,6 +236,9 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	if aggregator.GenericConfig.RESTOptionsGetter != nil {
+		aggregator.GenericConfig.RESTOptionsGetter = decorateRESTOptionsGetter("aggregator", aggregator.GenericConfig.RESTOptionsGetter, mcOpts)
+	}
 	// Ensure aggregator also receives multicluster routing
 	aggregator.GenericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
@@ -248,4 +259,11 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	c.Aggregator = aggregator
 
 	return c, nil
+}
+
+func decorateRESTOptionsGetter(server string, getter generic.RESTOptionsGetter, opts mc.Options) generic.RESTOptionsGetter {
+	opts.ServerName = server
+	decorated := mc.RESTOptionsDecorator{Delegate: getter, Options: opts}
+	klog.Infof("mc.restOptionsGetter server=%s decorated=%t", server, true)
+	return decorated
 }
