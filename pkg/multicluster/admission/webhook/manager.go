@@ -30,6 +30,9 @@ type Options struct {
 	// PathPrefix and ControlPlaneSegment define the cluster URL form.
 	PathPrefix          string
 	ControlPlaneSegment string
+
+	// CelRuntime provides shared CEL env/compiler caching for matchConditions.
+	CelRuntime *CelRuntime
 }
 
 type Manager struct {

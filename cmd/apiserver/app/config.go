@@ -181,6 +181,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		kubeAPIs.ControlPlane.Generic.LoopbackClientConfig,
 		kubeAPIs.ControlPlane.Generic.TracerProvider,
 	)
+	celRuntime := mcwh.NewCelRuntime()
 	mcWebhookMgr := mcwh.NewManager(mcwh.Options{
 		BaseLoopbackClientConfig: kubeAPIs.ControlPlane.Generic.LoopbackClientConfig,
 		AuthWrapper:              authWrapper,
@@ -188,6 +189,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		Hostname:                 kubeAPIs.ControlPlane.Generic.LoopbackClientConfig.Host,
 		PathPrefix:               mcOpts.PathPrefix,
 		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
+		CelRuntime:               celRuntime,
 	})
 	mcMutatingWebhook := mcwh.NewMutating(mcOpts, mcWebhookMgr)
 	mcValidatingWebhook := mcwh.NewValidating(mcOpts, mcWebhookMgr)
