@@ -25,6 +25,8 @@ type Options struct {
 	ClusterFieldKey      string
 	WatchStrategy        WatchStrategy
 	ClusterSource        ClusterSource
+	// ServerName identifies the apiserver instance using this options set (for metrics/logging).
+	ServerName string
 }
 
 const (
@@ -206,9 +208,9 @@ func (l KeyLayout) KindRoot(gr GroupResource) string {
 		p = DefaultEtcdPrefix
 	}
 	if gr.Group == "" { // core
-		return p + "/" + gr.Resource
+		return p + "/" + gr.Resource + "/clusters"
 	}
-	return p + "/" + gr.Group + "/" + gr.Resource
+	return p + "/" + gr.Group + "/" + gr.Resource + "/clusters"
 }
 
 // PerClusterRoot returns the per-cluster layout root for a resource kind.
@@ -218,7 +220,7 @@ func (l KeyLayout) PerClusterRoot(cluster string, gr GroupResource) string {
 		p = DefaultEtcdPrefix
 	}
 	if gr.Group == "" {
-		return p + "/" + cluster + "/" + gr.Resource
+		return p + "/" + gr.Resource + "/clusters/" + cluster
 	}
-	return p + "/" + cluster + "/" + gr.Group + "/" + gr.Resource
+	return p + "/" + gr.Group + "/" + gr.Resource + "/clusters/" + cluster
 }
