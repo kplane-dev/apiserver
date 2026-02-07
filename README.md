@@ -218,13 +218,13 @@ We added counters/gauges to validate store creation patterns and CEL caching:
 ### Docker image
 Build locally:
 ```bash
-docker build -t yourrepo/apiserver:dev .
+docker build -t kplane-dev/apiserver:dev .
 ```
 
 Run container (etcd assumed on host):
 ```bash
 docker run --rm -p 6443:6443 \
-  yourrepo/apiserver:dev \
+  kplane-dev/apiserver:dev \
   --etcd-servers=http://host.docker.internal:2379 \
   --service-cluster-ip-range=10.0.0.0/24 \
   --allow-privileged=true \
