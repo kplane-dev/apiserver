@@ -43,15 +43,15 @@ func (m *Mutating) Admit(ctx context.Context, a apiserveradmission.Attributes, _
 	if err != nil {
 		return nil
 	}
-	anns := accessor.GetAnnotations()
-	if anns == nil {
-		anns = map[string]string{}
+	lbls := accessor.GetLabels()
+	if lbls == nil {
+		lbls = map[string]string{}
 	}
 	key := m.Options.ClusterAnnotationKey
 	if key == "" {
 		key = mcv1.DefaultClusterAnnotation
 	}
-	anns[key] = cid
-	accessor.SetAnnotations(anns)
+	lbls[key] = cid
+	accessor.SetLabels(lbls)
 	return nil
 }

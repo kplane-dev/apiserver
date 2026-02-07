@@ -23,8 +23,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/admission"
+	namespaceplugin "k8s.io/apiserver/pkg/admission/plugin/namespace/lifecycle"
+	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/pkg/util/webhook"
+	"k8s.io/klog/v2"
 	aggregatorapiserver "k8s.io/kube-aggregator/pkg/apiserver"
 	aggregatorscheme "k8s.io/kube-aggregator/pkg/apiserver/scheme"
 
@@ -36,6 +39,7 @@ import (
 	"github.com/kplane-dev/apiserver/cmd/apiserver/app/options"
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
 	mca "github.com/kplane-dev/apiserver/pkg/multicluster/admission"
+	mcnsl "github.com/kplane-dev/apiserver/pkg/multicluster/admission/namespace"
 	mcwh "github.com/kplane-dev/apiserver/pkg/multicluster/admission/webhook"
 	mcauth "github.com/kplane-dev/apiserver/pkg/multicluster/auth"
 )
@@ -92,6 +96,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 			opts.Admission.GenericAdmission.DisablePlugins,
 			"MutatingAdmissionWebhook",
 			"ValidatingAdmissionWebhook",
+			namespaceplugin.PluginName,
 		)
 	}
 
@@ -111,6 +116,8 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	if opts.RootControlPlaneName != "" {
 		mcOpts.DefaultCluster = opts.RootControlPlaneName
 	}
+	clientPool := mc.NewClientPool(genericConfig.LoopbackClientConfig, mcOpts.PathPrefix, mcOpts.ControlPlaneSegment)
+	informerPool := mc.NewInformerPoolFromClientPool(clientPool, 0, genericConfig.DrainedNotify())
 	genericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
 		return mc.WithClusterRouting(server.DefaultBuildHandlerChain(h, conf), ex, mcOpts)
@@ -124,6 +131,8 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		Authorization:            opts.Authorization,
 		EgressSelector:           genericConfig.EgressSelector,
 		APIServerID:              genericConfig.APIServerID,
+		ClientPool:               clientPool,
+		InformerPool:             informerPool,
 	})
 	if genericConfig.Authentication.Authenticator != nil {
 		genericConfig.Authentication.Authenticator = mcauth.NewClusterAuthenticator(mcOpts.DefaultCluster, genericConfig.Authentication.Authenticator, authManager)
@@ -136,15 +145,25 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 
 	// Decorate storage to inject cluster-aware key rewriting and filtering
 	if genericConfig.RESTOptionsGetter != nil {
-		genericConfig.RESTOptionsGetter = mc.RESTOptionsDecorator{Delegate: genericConfig.RESTOptionsGetter, Options: mcOpts}
+		genericConfig.RESTOptionsGetter = decorateRESTOptionsGetter("controlplane", genericConfig.RESTOptionsGetter, mcOpts)
 	}
 
-	// Wrap admission: mutating first, then existing chain, then validating
+	// Cluster-aware namespace lifecycle (per-cluster client + informer).
+	mcNamespaceMgr := mcnsl.NewManager(mcnsl.Options{
+		BaseLoopbackClientConfig: genericConfig.LoopbackClientConfig,
+		PathPrefix:               mcOpts.PathPrefix,
+		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
+		ClientPool:               clientPool,
+		InformerPool:             informerPool,
+	})
+	mcNamespaceLifecycle := mcnsl.NewLifecycle(mcOpts, mcNamespaceMgr)
+
+	// Wrap admission: mutating first, namespace lifecycle, then existing chain, then validating
 	{
 		mut := mca.NewMutating(mcOpts)
 		val := mca.NewValidating(mcOpts)
 		base := genericConfig.AdmissionControl
-		chain := []admission.Interface{mut}
+		chain := []admission.Interface{mut, mcNamespaceLifecycle}
 		if base != nil {
 			chain = append(chain, base)
 		}
@@ -157,6 +176,9 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		return nil, err
 	}
 	c.KubeAPIs = kubeAPIs
+	if c.KubeAPIs.ControlPlane.Generic.RESTOptionsGetter != nil {
+		c.KubeAPIs.ControlPlane.Generic.RESTOptionsGetter = decorateRESTOptionsGetter("controlplane", c.KubeAPIs.ControlPlane.Generic.RESTOptionsGetter, mcOpts)
+	}
 
 	// Cluster-aware webhook admission (per-cluster clients + informers, no global cross-cluster view).
 	authWrapper := webhook.NewDefaultAuthenticationInfoResolverWrapper(
@@ -165,6 +187,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		kubeAPIs.ControlPlane.Generic.LoopbackClientConfig,
 		kubeAPIs.ControlPlane.Generic.TracerProvider,
 	)
+	celRuntime := mcwh.NewCelRuntime()
 	mcWebhookMgr := mcwh.NewManager(mcwh.Options{
 		BaseLoopbackClientConfig: kubeAPIs.ControlPlane.Generic.LoopbackClientConfig,
 		AuthWrapper:              authWrapper,
@@ -172,6 +195,9 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		Hostname:                 kubeAPIs.ControlPlane.Generic.LoopbackClientConfig.Host,
 		PathPrefix:               mcOpts.PathPrefix,
 		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
+		CelRuntime:               celRuntime,
+		ClientPool:               clientPool,
+		InformerPool:             informerPool,
 	})
 	mcMutatingWebhook := mcwh.NewMutating(mcOpts, mcWebhookMgr)
 	mcValidatingWebhook := mcwh.NewValidating(mcOpts, mcWebhookMgr)
@@ -181,7 +207,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		mut := mca.NewMutating(mcOpts)
 		val := mca.NewValidating(mcOpts)
 		base := c.KubeAPIs.ControlPlane.Generic.AdmissionControl
-		chain := []admission.Interface{mut, mcMutatingWebhook}
+		chain := []admission.Interface{mut, mcNamespaceLifecycle, mcMutatingWebhook}
 		if base != nil {
 			chain = append(chain, base)
 		}
@@ -194,6 +220,9 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	if apiExtensions.GenericConfig.RESTOptionsGetter != nil {
+		apiExtensions.GenericConfig.RESTOptionsGetter = decorateRESTOptionsGetter("apiextensions", apiExtensions.GenericConfig.RESTOptionsGetter, mcOpts)
+	}
 	// Ensure CRDs are also routed through the multicluster handler
 	apiExtensions.GenericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
@@ -204,7 +233,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		mut := mca.NewMutating(mcOpts)
 		val := mca.NewValidating(mcOpts)
 		base := apiExtensions.GenericConfig.AdmissionControl
-		chain := []admission.Interface{mut, mcMutatingWebhook}
+		chain := []admission.Interface{mut, mcNamespaceLifecycle, mcMutatingWebhook}
 		if base != nil {
 			chain = append(chain, base)
 		}
@@ -217,6 +246,9 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	if aggregator.GenericConfig.RESTOptionsGetter != nil {
+		aggregator.GenericConfig.RESTOptionsGetter = decorateRESTOptionsGetter("aggregator", aggregator.GenericConfig.RESTOptionsGetter, mcOpts)
+	}
 	// Ensure aggregator also receives multicluster routing
 	aggregator.GenericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
@@ -227,7 +259,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		mut := mca.NewMutating(mcOpts)
 		val := mca.NewValidating(mcOpts)
 		base := aggregator.GenericConfig.AdmissionControl
-		chain := []admission.Interface{mut, mcMutatingWebhook}
+		chain := []admission.Interface{mut, mcNamespaceLifecycle, mcMutatingWebhook}
 		if base != nil {
 			chain = append(chain, base)
 		}
@@ -237,4 +269,15 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	c.Aggregator = aggregator
 
 	return c, nil
+}
+
+func decorateRESTOptionsGetter(server string, getter generic.RESTOptionsGetter, opts mc.Options) generic.RESTOptionsGetter {
+	if _, ok := getter.(mc.RESTOptionsDecorator); ok {
+		klog.Infof("mc.restOptionsGetter server=%s alreadyDecorated=true", server)
+		return getter
+	}
+	opts.ServerName = server
+	decorated := mc.RESTOptionsDecorator{Delegate: getter, Options: opts}
+	klog.Infof("mc.restOptionsGetter server=%s decorated=%t", server, true)
+	return decorated
 }

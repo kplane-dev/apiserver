@@ -7,10 +7,10 @@ import (
 	"time"
 
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
+	mcmutating "github.com/kplane-dev/apiserver/pkg/multicluster/admission/webhook/mutating"
+	mcvalidating "github.com/kplane-dev/apiserver/pkg/multicluster/admission/webhook/validating"
 
 	"k8s.io/apiserver/pkg/admission"
-	upstreammutating "k8s.io/apiserver/pkg/admission/plugin/webhook/mutating"
-	upstreamvalidating "k8s.io/apiserver/pkg/admission/plugin/webhook/validating"
 )
 
 // MutatingPlugin dispatches upstream MutatingAdmissionWebhook per cluster.
@@ -35,12 +35,12 @@ type ValidatingPlugin struct {
 
 type mutatingEntry struct {
 	env    *clusterEnv
-	plugin *upstreammutating.Plugin
+	plugin *mcmutating.Plugin
 }
 
 type validatingEntry struct {
 	env    *clusterEnv
-	plugin *upstreamvalidating.Plugin
+	plugin *mcvalidating.Plugin
 }
 
 func NewMutating(opts mc.Options, mgr *Manager) *MutatingPlugin {
@@ -73,7 +73,7 @@ func (p *ValidatingPlugin) Validate(ctx context.Context, attr admission.Attribut
 	return plugin.Validate(ctx, attr, o)
 }
 
-func (p *MutatingPlugin) forCluster(ctx context.Context) (*clusterEnv, *upstreammutating.Plugin) {
+func (p *MutatingPlugin) forCluster(ctx context.Context) (*clusterEnv, *mcmutating.Plugin) {
 	cid, _, _ := mc.FromContext(ctx)
 	if cid == "" {
 		cid = p.opts.DefaultCluster
@@ -95,9 +95,16 @@ func (p *MutatingPlugin) forCluster(ctx context.Context) (*clusterEnv, *upstream
 		panic(err)
 	}
 
-	plugin, err := upstreammutating.NewMutatingWebhook(io.Reader(nil))
+	plugin, err := mcmutating.NewMutatingWebhook(io.Reader(nil))
 	if err != nil {
 		panic(err)
+	}
+	if p.mgr.opts.CelRuntime != nil {
+		compiler, err := p.mgr.opts.CelRuntime.BaseCompiler()
+		if err != nil {
+			panic(err)
+		}
+		plugin.SetConditionCompiler(compiler)
 	}
 	plugin.SetExternalKubeClientSet(env.clientset)
 	plugin.SetExternalKubeInformerFactory(env.informers)
@@ -113,7 +120,7 @@ func (p *MutatingPlugin) forCluster(ctx context.Context) (*clusterEnv, *upstream
 	return env, plugin
 }
 
-func (p *ValidatingPlugin) forCluster(ctx context.Context) (*clusterEnv, *upstreamvalidating.Plugin) {
+func (p *ValidatingPlugin) forCluster(ctx context.Context) (*clusterEnv, *mcvalidating.Plugin) {
 	cid, _, _ := mc.FromContext(ctx)
 	if cid == "" {
 		cid = p.opts.DefaultCluster
@@ -133,9 +140,16 @@ func (p *ValidatingPlugin) forCluster(ctx context.Context) (*clusterEnv, *upstre
 		panic(err)
 	}
 
-	plugin, err := upstreamvalidating.NewValidatingAdmissionWebhook(io.Reader(nil))
+	plugin, err := mcvalidating.NewValidatingAdmissionWebhook(io.Reader(nil))
 	if err != nil {
 		panic(err)
+	}
+	if p.mgr.opts.CelRuntime != nil {
+		compiler, err := p.mgr.opts.CelRuntime.BaseCompiler()
+		if err != nil {
+			panic(err)
+		}
+		plugin.SetConditionCompiler(compiler)
 	}
 	plugin.SetExternalKubeClientSet(env.clientset)
 	plugin.SetExternalKubeInformerFactory(env.informers)

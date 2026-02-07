@@ -13,7 +13,7 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	clientgoinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/listers/core/v1"
+	v1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/kubernetes/pkg/controller/serviceaccount"
 	"k8s.io/kubernetes/pkg/features"
@@ -30,6 +30,8 @@ type Options struct {
 	Authorization            *kubeoptions.BuiltInAuthorizationOptions
 	EgressSelector           *egressselector.EgressSelector
 	APIServerID              string
+	ClientPool               *mc.ClientPool
+	InformerPool             *mc.InformerPool
 }
 
 // Manager builds per-cluster authenticators and authorizers on demand.
@@ -44,9 +46,6 @@ type Manager struct {
 type clusterEnv struct {
 	cid string
 
-	stopOnce sync.Once
-	stopCh   chan struct{}
-
 	clientset kubernetes.Interface
 	informers clientgoinformers.SharedInformerFactory
 
@@ -59,6 +58,12 @@ type clusterEnv struct {
 func NewManager(ctx context.Context, opts Options) *Manager {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if opts.ClientPool == nil && opts.BaseLoopbackClientConfig != nil {
+		opts.ClientPool = mc.NewClientPool(opts.BaseLoopbackClientConfig, opts.PathPrefix, opts.ControlPlaneSegment)
+	}
+	if opts.InformerPool == nil && opts.ClientPool != nil {
+		opts.InformerPool = mc.NewInformerPoolFromClientPool(opts.ClientPool, 0, nil)
 	}
 	return &Manager{
 		ctx:      ctx,
@@ -93,14 +98,12 @@ func (m *Manager) StopCluster(clusterID string) {
 	if !ok {
 		return
 	}
-	env.stop()
 	delete(m.clusters, clusterID)
-}
-
-func (e *clusterEnv) stop() {
-	e.stopOnce.Do(func() {
-		close(e.stopCh)
-	})
+	if m.opts.InformerPool != nil {
+		m.opts.InformerPool.StopCluster(clusterID)
+	} else {
+		_ = env
+	}
 }
 
 func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
@@ -110,28 +113,16 @@ func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
 		return env, nil
 	}
 
-	if m.opts.BaseLoopbackClientConfig == nil {
+	if m.opts.InformerPool == nil {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("loopback client config is required for cluster auth")
+		return nil, fmt.Errorf("loopback informer pool is required for cluster auth")
 	}
 
-	cfg := rest.CopyConfig(m.opts.BaseLoopbackClientConfig)
-	host, err := mc.ClusterHost(cfg.Host, mc.Options{
-		PathPrefix:          m.opts.PathPrefix,
-		ControlPlaneSegment: m.opts.ControlPlaneSegment,
-	}, clusterID)
+	cs, informers, _, err := m.opts.InformerPool.Get(clusterID)
 	if err != nil {
 		m.mu.Unlock()
 		return nil, err
 	}
-	cfg.Host = host
-
-	cs, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		m.mu.Unlock()
-		return nil, err
-	}
-	informers := clientgoinformers.NewSharedInformerFactory(cs, 0)
 
 	authn, err := buildAuthenticator(m.ctx, m.opts, cs, informers)
 	if err != nil {
@@ -146,20 +137,11 @@ func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
 
 	env := &clusterEnv{
 		cid:           clusterID,
-		stopCh:        make(chan struct{}),
 		clientset:     cs,
 		informers:     informers,
 		authenticator: authn,
 		authorizer:    authz,
 		ruleResolver:  resolver,
-	}
-	informers.Start(env.stopCh)
-
-	if done := m.ctx.Done(); done != nil {
-		go func() {
-			<-done
-			env.stop()
-		}()
 	}
 
 	m.clusters[clusterID] = env
