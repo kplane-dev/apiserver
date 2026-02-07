@@ -59,6 +59,144 @@ clients and informers. This isolates RBAC data, service-account tokens, and
 TokenReview/SubjectAccessReview evaluations so clusters can operate alongside
 each other without sharing auth state.
 
+### Core improvements
+This section summarizes the core multicluster improvements and shows code
+examples from this repo.
+
+#### Storage + watchcache correctness
+We keep **one store per resource** and encode the cluster into the etcd key
+layout. Each request rewrites the key with the cluster ID from the request
+context. The watchcache uses a key function that derives the cluster from the
+stored object label so LIST/WATCH stay correct without per-cluster caches.
+
+Key layout:
+`/registry/<resource>/clusters/<cid>/...`
+
+```go
+func (c *clusteredStorage) storeAndKey(ctx context.Context, key string) (storage.Interface, string, error) {
+	cid, all, _ := FromContext(ctx)
+	if cid == "" {
+		cid = c.defaultCluster()
+	}
+	store, err := c.ensureStore()
+	if err != nil {
+		return nil, key, err
+	}
+	if all {
+		return store, c.kindRootPrefix(), nil
+	}
+	rewritten := c.rewriteKey(cid, key)
+	return store, rewritten, nil
+}
+```
+
+```go
+keyFunc := func(obj runtime.Object) (string, error) {
+	key, err := c.keyFunc(obj)
+	if err != nil {
+		return "", err
+	}
+	// Watchcache keys must include the object cluster label.
+	return c.rewriteKey(c.clusterFromObject(obj), key), nil
+}
+```
+
+#### Admission: server-owned cluster label
+We stamp a server-owned cluster label on persisted objects and validate it on
+create/update to prevent cross-cluster writes and support watchcache keying.
+
+```go
+lbls := accessor.GetLabels()
+if lbls == nil {
+	lbls = map[string]string{}
+}
+key := m.Options.ClusterAnnotationKey
+if key == "" {
+	key = mcv1.DefaultClusterAnnotation
+}
+lbls[key] = cid
+accessor.SetLabels(lbls)
+```
+
+```go
+if cid := acc.GetLabels()[key]; cid != reqCID {
+	return fmt.Errorf("cluster label %q=%q must match request cluster %q", key, cid, reqCID)
+}
+```
+
+#### Webhooks: per-cluster envs
+Webhook admission is isolated by building a per-cluster environment with a
+cluster-scoped clientset, shared informer factory, and service resolver.
+
+```go
+cs, inf, stopCh, err := m.opts.InformerPool.Get(clusterID)
+if err != nil {
+	return nil, err
+}
+sr := newDirectServiceResolver(cs, m.opts.EnableAggregatorRouting, m.opts.Hostname)
+e := &clusterEnv{
+	cid:             clusterID,
+	stopCh:          stopCh,
+	synced:          make(chan struct{}),
+	clientset:       cs,
+	informers:       inf,
+	serviceResolver: sr,
+}
+inf.Start(stopCh)
+go func() {
+	ok := inf.WaitForCacheSync(e.stopCh)
+	e.okMu.Lock()
+	e.ok = allSynced(ok)
+	e.okMu.Unlock()
+	close(e.synced)
+}()
+```
+
+#### Client + informer pooling with eviction
+Clients and informers are shared per cluster and can be evicted after idle
+periods to reduce long-lived memory/goroutine growth.
+
+```go
+cfg := rest.CopyConfig(p.base)
+host, err := ClusterHost(cfg.Host, Options{
+	PathPrefix:          p.pathPrefix,
+	ControlPlaneSegment: p.controlPlaneSegment,
+}, clusterID)
+if err != nil {
+	return nil, err
+}
+cfg.Host = host
+```
+
+```go
+if p.opts.StartOnGet {
+	entry.start()
+}
+return entry.clientset, entry.factory, entry.stopCh, nil
+```
+
+#### CEL runtime caching
+CEL environments and compilers for webhook match conditions are cached by
+cluster/GVK/schema and tracked with metrics.
+
+```go
+r.mu.RLock()
+if compiler, ok := r.compilers[key]; ok {
+	r.mu.RUnlock()
+	r.cacheHitTotal.WithLabelValues(reason).Inc()
+	return compiler, nil
+}
+r.mu.RUnlock()
+```
+
+#### Observability
+We added counters/gauges to validate store creation patterns and CEL caching:
+- `mc_storage_ensure_store_total`
+- `mc_storage_base_decorator_total`
+- `mc_cel_env_build_total`
+- `mc_cel_env_cache_hit_total`
+- `mc_cel_env_cache_size`
+
 ### Docker image
 Build locally:
 ```bash
