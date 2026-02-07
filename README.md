@@ -70,7 +70,7 @@ context. The watchcache uses a key function that derives the cluster from the
 stored object label so LIST/WATCH stay correct without per-cluster caches.
 
 Key layout:
-`/registry/<resource>/clusters/<cid>/...`
+`/registry/<group?>/<resource>/clusters/<cid>/...`
 
 ```go
 func (c *clusteredStorage) storeAndKey(ctx context.Context, key string) (storage.Interface, string, error) {
@@ -117,6 +117,9 @@ if key == "" {
 lbls[key] = cid
 accessor.SetLabels(lbls)
 ```
+Note: the `ClusterAnnotationKey` fallback to `DefaultClusterAnnotation` is
+temporary and not ideal. It exists to preserve compatibility while we migrate
+callers to an explicit label key; avoid relying on this fallback long term.
 
 ```go
 if cid := acc.GetLabels()[key]; cid != reqCID {
@@ -142,6 +145,11 @@ e := &clusterEnv{
 	informers:       inf,
 	serviceResolver: sr,
 }
+_ = inf.Core().V1().Namespaces().Informer()
+_ = inf.Core().V1().Services().Informer()
+_ = inf.Discovery().V1().EndpointSlices().Informer()
+_ = inf.Admissionregistration().V1().MutatingWebhookConfigurations().Informer()
+_ = inf.Admissionregistration().V1().ValidatingWebhookConfigurations().Informer()
 inf.Start(stopCh)
 go func() {
 	ok := inf.WaitForCacheSync(e.stopCh)
