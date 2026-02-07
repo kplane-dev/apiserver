@@ -3,7 +3,7 @@
 Multicluster Kubernetes API server with path-based cluster routing.
 
 kplane virtual control planes (VCPs) use about
-0.8MB of memory per control plane on the apiserver side. This model keeps
+0.8MB of memory per control plane on the apiserver side (with room for improvement). This model keeps
 single per-resource watchcaches and shared clients/informers while preserving
 per-control-plane isolation and reliability, instead of paying the per-cluster
 etcd/apiserver overhead of fully separate control planes.
