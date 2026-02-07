@@ -231,8 +231,3 @@ ETCD_ENDPOINTS=http://127.0.0.1:2379 go test -v ./test/smoke -timeout 10m
 ### CI/CD
 - `ci` workflow runs on pushes and PRs: builds and runs smoke tests (with an etcd service).
 - `release` workflow triggers on GitHub Release creation: runs smoke tests, then builds and pushes a multi-arch Docker image to Docker Hub.
-
-Configure repository variables and secrets:
-- Variable `DOCKERHUB_REPO`: e.g. `youruser/apiserver`
-- Secret `DOCKERHUB_USERNAME`
-- Secret `DOCKERHUB_TOKEN` (Docker Hub access token)
