@@ -69,6 +69,16 @@ layout. Each request rewrites the key with the cluster ID from the request
 context. The watchcache uses a key function that derives the cluster from the
 stored object label so LIST/WATCH stay correct without per-cluster caches.
 
+We place `clusters/<cid>` **after the resource prefix** (not `/clusters/<cid>/...`)
+because keys are produced by per-resource `keyFunc`s. Those functions only know
+the resource-local prefix (like `/registry/<group?>/<resource>/...`), so the
+cluster segment must be inserted within that prefix to keep key rewriting and
+watchcache keying consistent. A top-level `/clusters/<cid>/...` layout would
+push us toward per-cluster stores and per-cluster watchcaches, which multiply
+LIST/WATCH streams (`resources × clusters`) and goroutines. By keeping one
+per-resource store and list/watch and filtering by key prefix server-side, we
+reduce watch fanout and avoid unnecessary per-cluster overhead.
+
 Key layout:
 `/registry/<group?>/<resource>/clusters/<cid>/...`
 
