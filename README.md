@@ -8,6 +8,10 @@ single per-resource watchcaches and shared clients/informers while preserving
 per-control-plane isolation and reliability, instead of paying the per-cluster
 etcd/apiserver overhead of fully separate control planes.
 
+### Get started
+Skip ahead to the CLI in `kplane-dev/kplane` to create and manage virtual
+control planes: https://github.com/kplane-dev/kplane
+
 ### Requirements
 - Go 1.24.6
 - etcd (3.5+ for local testing)
