@@ -19,7 +19,6 @@ package app
 import (
 	"net/http"
 	"strings"
-	"time"
 
 	apiextensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -311,19 +310,10 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		apiExtensions.GenericConfig.RESTOptionsGetter = decorateRESTOptionsGetter("apiextensions", apiExtensions.GenericConfig.RESTOptionsGetter, mcOpts)
 	}
 	crdRuntimeMgr = mcbootstrap.NewCRDRuntimeManager(mcbootstrap.CRDRuntimeManagerOptions{
-		BaseLoopbackClientConfig: apiExtensions.GenericConfig.LoopbackClientConfig,
-		PathPrefix:               mcOpts.PathPrefix,
-		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
-		DefaultCluster:           mcOpts.DefaultCluster,
-		CRDRESTOptionsGetter:     apiExtensions.ExtraConfig.CRDRESTOptionsGetter,
-		Admission:                apiExtensions.GenericConfig.AdmissionControl,
-		ServiceResolver:          apiExtensions.ExtraConfig.ServiceResolver,
-		AuthResolverWrapper:      apiExtensions.ExtraConfig.AuthResolverWrapper,
-		MasterCount:              apiExtensions.ExtraConfig.MasterCount,
-		Authorizer:               apiExtensions.GenericConfig.Authorization.Authorizer,
-		RequestTimeout:           apiExtensions.GenericConfig.RequestTimeout,
-		MinRequestTimeout:        time.Duration(apiExtensions.GenericConfig.MinRequestTimeout) * time.Second,
-		MaxRequestBodyBytes:      apiExtensions.GenericConfig.MaxRequestBodyBytes,
+		BaseAPIExtensionsConfig: apiExtensions,
+		PathPrefix:              mcOpts.PathPrefix,
+		ControlPlaneSegment:     mcOpts.ControlPlaneSegment,
+		DefaultCluster:          mcOpts.DefaultCluster,
 	})
 	prevOnClusterSelected := mcOpts.OnClusterSelected
 	mcOpts.OnClusterSelected = func(clusterID string) {

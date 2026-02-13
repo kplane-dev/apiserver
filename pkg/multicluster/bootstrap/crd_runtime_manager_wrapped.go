@@ -7,19 +7,15 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apiserver/pkg/admission"
-	"k8s.io/apiserver/pkg/authorization/authorizer"
-	genericregistry "k8s.io/apiserver/pkg/registry/generic"
-	"k8s.io/apiserver/pkg/util/webhook"
+	"k8s.io/apiserver/pkg/server"
 	"k8s.io/client-go/rest"
 	"k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
-	"k8s.io/kube-openapi/pkg/validation/spec"
-	"golang.org/x/sync/singleflight"
 
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
 )
@@ -40,18 +36,11 @@ var (
 )
 
 type CRDRuntimeManagerOptions struct {
-	BaseLoopbackClientConfig *rest.Config
-	PathPrefix, ControlPlaneSegment, DefaultCluster string
-	Delegate                                        http.Handler
-	CRDRESTOptionsGetter                            genericregistry.RESTOptionsGetter
-	Admission                                       admission.Interface
-	ServiceResolver                                 webhook.ServiceResolver
-	AuthResolverWrapper                             webhook.AuthenticationInfoResolverWrapper
-	MasterCount                                     int
-	Authorizer                                      authorizer.Authorizer
-	RequestTimeout, MinRequestTimeout               time.Duration
-	StaticOpenAPISpec                               map[string]*spec.Schema
-	MaxRequestBodyBytes                             int64
+	BaseAPIExtensionsConfig *apiextensionsapiserver.Config
+	PathPrefix              string
+	ControlPlaneSegment     string
+	DefaultCluster          string
+	Delegate                http.Handler
 }
 
 type servesCacheEntry struct {
@@ -59,51 +48,52 @@ type servesCacheEntry struct {
 	exp    time.Time
 }
 
+type runtimeEntry struct {
+	handler http.Handler
+	server  *server.GenericAPIServer
+	cancel  context.CancelFunc
+}
+
 type clusterState struct {
-	rt *apiextensionsapiserver.ClusterScopedCRDRuntime
-	cs *apiextensionsclient.Clientset
+	r runtimeEntry
+	c *apiextensionsclient.Clientset
 }
 
 type CRDRuntimeManager struct {
 	opts CRDRuntimeManagerOptions
 
-	mu      sync.Mutex
-	runtimes map[string]*apiextensionsapiserver.ClusterScopedCRDRuntime
-	clients  map[string]*apiextensionsclient.Clientset
-	started  map[string]bool
-
-	cache      map[string]servesCacheEntry
+	mu          sync.Mutex
+	runtimes    map[string]runtimeEntry
+	clients     map[string]*apiextensionsclient.Clientset
+	started     map[string]bool
+	cache       map[string]servesCacheEntry
 	clusterKeys map[string]map[string]struct{}
-	createSF   singleflight.Group
+	createSF    singleflight.Group
 }
 
 func NewCRDRuntimeManager(opts CRDRuntimeManagerOptions) *CRDRuntimeManager {
 	crdRuntimeMetricsOnce.Do(func() {
 		legacyregistry.MustRegister(crdRuntimeCreateTotal, crdServesLookupTotal, crdServesCacheHit, crdServesCacheMiss, crdServesLookupLat)
 	})
-	if opts.BaseLoopbackClientConfig != nil {
-		opts.BaseLoopbackClientConfig = rest.CopyConfig(opts.BaseLoopbackClientConfig)
-	}
 	return &CRDRuntimeManager{
-		opts:       opts,
-		runtimes:   map[string]*apiextensionsapiserver.ClusterScopedCRDRuntime{},
-		clients:    map[string]*apiextensionsclient.Clientset{},
-		started:    map[string]bool{},
-		cache:      map[string]servesCacheEntry{},
+		opts:        opts,
+		runtimes:    map[string]runtimeEntry{},
+		clients:     map[string]*apiextensionsclient.Clientset{},
+		started:     map[string]bool{},
+		cache:       map[string]servesCacheEntry{},
 		clusterKeys: map[string]map[string]struct{}{},
 	}
 }
 
 func (m *CRDRuntimeManager) Runtime(clusterID string, stopCh <-chan struct{}) (http.Handler, error) {
-	if m == nil || clusterID == "" || clusterID == m.opts.DefaultCluster || m.opts.BaseLoopbackClientConfig == nil {
+	if m == nil || clusterID == "" || clusterID == m.opts.DefaultCluster || m.opts.BaseAPIExtensionsConfig == nil {
 		return nil, nil
 	}
-	rt, _, err := m.ensureClusterState(clusterID, stopCh)
-	if err != nil || rt == nil {
+	state, err := m.ensureClusterState(clusterID, stopCh)
+	if err != nil {
 		return nil, err
 	}
-	rt.Start(stopCh)
-	return rt.Handler(), nil
+	return state.r.handler, nil
 }
 
 func (m *CRDRuntimeManager) ServesGroupVersion(clusterID, group, version string, stopCh <-chan struct{}) (bool, error) {
@@ -120,7 +110,8 @@ func (m *CRDRuntimeManager) ServesGroupVersion(clusterID, group, version string,
 		return served, nil
 	}
 	crdServesCacheMiss.WithLabelValues("miss").Inc()
-	_, cs, err := m.ensureClusterState(clusterID, stopCh)
+
+	state, err := m.ensureClusterState(clusterID, stopCh)
 	if err != nil {
 		crdServesLookupTotal.WithLabelValues("error").Inc()
 		crdServesLookupLat.WithLabelValues("error").Observe(time.Since(start).Seconds())
@@ -128,12 +119,13 @@ func (m *CRDRuntimeManager) ServesGroupVersion(clusterID, group, version string,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), servesLookupTimeout)
 	defer cancel()
-	list, err := cs.ApiextensionsV1().CustomResourceDefinitions().List(ctx, metav1.ListOptions{})
+	list, err := state.c.ApiextensionsV1().CustomResourceDefinitions().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		crdServesLookupTotal.WithLabelValues("error").Inc()
 		crdServesLookupLat.WithLabelValues("error").Observe(time.Since(start).Seconds())
 		return false, err
 	}
+
 	served := false
 	for i := range list.Items {
 		crd := &list.Items[i]
@@ -157,91 +149,146 @@ func (m *CRDRuntimeManager) ServesGroupVersion(clusterID, group, version string,
 	return served, nil
 }
 
-func (m *CRDRuntimeManager) ensureClusterState(clusterID string, stopCh <-chan struct{}) (*apiextensionsapiserver.ClusterScopedCRDRuntime, *apiextensionsclient.Clientset, error) {
+func (m *CRDRuntimeManager) ensureClusterState(clusterID string, stopCh <-chan struct{}) (clusterState, error) {
 	m.mu.Lock()
-	if rt, ok := m.runtimes[clusterID]; ok {
-		cs := m.clients[clusterID]
+	if r, ok := m.runtimes[clusterID]; ok {
+		c := m.clients[clusterID]
 		m.mu.Unlock()
-		return rt, cs, nil
+		return clusterState{r: r, c: c}, nil
 	}
 	m.mu.Unlock()
+
 	v, err, _ := m.createSF.Do(clusterID, func() (any, error) {
 		m.mu.Lock()
-		if rt, ok := m.runtimes[clusterID]; ok {
-			cs := m.clients[clusterID]
+		if r, ok := m.runtimes[clusterID]; ok {
+			c := m.clients[clusterID]
 			m.mu.Unlock()
-			return clusterState{rt: rt, cs: cs}, nil
+			return clusterState{r: r, c: c}, nil
 		}
 		m.mu.Unlock()
-		cfg := rest.CopyConfig(m.opts.BaseLoopbackClientConfig)
-		host, err := mc.ClusterHost(cfg.Host, mc.Options{PathPrefix: m.opts.PathPrefix, ControlPlaneSegment: m.opts.ControlPlaneSegment}, clusterID)
+
+		if m.opts.BaseAPIExtensionsConfig == nil || m.opts.BaseAPIExtensionsConfig.GenericConfig == nil {
+			crdRuntimeCreateTotal.WithLabelValues("error").Inc()
+			return nil, fmt.Errorf("base apiextensions config is required")
+		}
+		baseGeneric := *m.opts.BaseAPIExtensionsConfig.GenericConfig
+		loopback := rest.CopyConfig(baseGeneric.LoopbackClientConfig)
+		host, err := mc.ClusterHost(loopback.Host, mc.Options{
+			PathPrefix:          m.opts.PathPrefix,
+			ControlPlaneSegment: m.opts.ControlPlaneSegment,
+		}, clusterID)
 		if err != nil {
 			crdRuntimeCreateTotal.WithLabelValues("error").Inc()
 			return nil, fmt.Errorf("build cluster host: %w", err)
 		}
-		cfg.Host = host
-		rt, err := apiextensionsapiserver.NewClusterScopedCRDRuntime(apiextensionsapiserver.ClusterScopedCRDConfig{
-			LoopbackClientConfig: cfg, Delegate: m.opts.Delegate, CRDRESTOptionsGetter: m.opts.CRDRESTOptionsGetter,
-			Admission: m.opts.Admission, ServiceResolver: m.opts.ServiceResolver, AuthResolverWrapper: m.opts.AuthResolverWrapper,
-			MasterCount: m.opts.MasterCount, Authorizer: m.opts.Authorizer, RequestTimeout: m.opts.RequestTimeout, MinRequestTimeout: m.opts.MinRequestTimeout,
-			StaticOpenAPISpec: m.opts.StaticOpenAPISpec, MaxRequestBodyBytes: m.opts.MaxRequestBodyBytes,
-		})
+		loopback.Host = host
+		baseGeneric.LoopbackClientConfig = loopback
+
+		baseCfg := *m.opts.BaseAPIExtensionsConfig
+		baseCfg.GenericConfig = &baseGeneric
+		completed := baseCfg.Complete()
+		delegate := m.opts.Delegate
+		if delegate == nil {
+			delegate = http.NotFoundHandler()
+		}
+		crdServer, err := completed.New(server.NewEmptyDelegateWithCustomHandler(delegate))
 		if err != nil {
 			crdRuntimeCreateTotal.WithLabelValues("error").Inc()
 			return nil, err
 		}
-		cs, err := apiextensionsclient.NewForConfig(rest.CopyConfig(cfg))
+		runCtx, cancel := context.WithCancel(context.Background())
+		go crdServer.GenericAPIServer.RunPostStartHooks(runCtx)
+
+		cs, err := apiextensionsclient.NewForConfig(rest.CopyConfig(loopback))
 		if err != nil {
+			cancel()
+			crdServer.GenericAPIServer.Destroy()
 			crdRuntimeCreateTotal.WithLabelValues("error").Inc()
 			return nil, err
 		}
-		rt.Start(stopCh)
+		entry := runtimeEntry{
+			handler: crdServer.GenericAPIServer.Handler.NonGoRestfulMux,
+			server:  crdServer.GenericAPIServer,
+			cancel:  cancel,
+		}
+		if stopCh != nil {
+			go func() {
+				<-stopCh
+				cancel()
+				crdServer.GenericAPIServer.Destroy()
+			}()
+		}
+
 		m.mu.Lock()
-		m.runtimes[clusterID] = rt
+		m.runtimes[clusterID] = entry
 		m.clients[clusterID] = cs
 		if !m.started[clusterID] {
 			m.started[clusterID] = true
 			go m.watchUpdates(clusterID, cs, stopCh)
 		}
 		m.mu.Unlock()
+
 		crdRuntimeCreateTotal.WithLabelValues("success").Inc()
-		return clusterState{rt: rt, cs: cs}, nil
+		return clusterState{r: entry, c: cs}, nil
 	})
 	if err != nil {
-		return nil, nil, err
+		return clusterState{}, err
 	}
-	s := v.(clusterState)
-	return s.rt, s.cs, nil
+	state, ok := v.(clusterState)
+	if !ok {
+		return clusterState{}, fmt.Errorf("unexpected cluster state type %T", v)
+	}
+	return state, nil
 }
 
 func (m *CRDRuntimeManager) watchUpdates(clusterID string, cs *apiextensionsclient.Clientset, stopCh <-chan struct{}) {
 	for {
-		select { case <-stopCh: return; default: }
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		w, err := cs.ApiextensionsV1().CustomResourceDefinitions().Watch(ctx, metav1.ListOptions{AllowWatchBookmarks: true, ResourceVersion: "0"})
 		if err != nil {
 			cancel()
-			select { case <-stopCh: return; case <-time.After(watchRetryBackoff): continue }
+			select {
+			case <-stopCh:
+				return
+			case <-time.After(watchRetryBackoff):
+				continue
+			}
 		}
 		m.invalidateCluster(clusterID)
 		closed := false
 		for !closed {
 			select {
 			case <-stopCh:
-				w.Stop(); cancel(); return
+				w.Stop()
+				cancel()
+				return
 			case _, ok := <-w.ResultChan():
-				if !ok { closed = true; break }
+				if !ok {
+					closed = true
+					break
+				}
 				m.invalidateCluster(clusterID)
 			}
 		}
-		w.Stop(); cancel()
-		select { case <-stopCh: return; case <-time.After(watchRetryBackoff): }
+		w.Stop()
+		cancel()
+		select {
+		case <-stopCh:
+			return
+		case <-time.After(watchRetryBackoff):
+		}
 	}
 }
 
 func (m *CRDRuntimeManager) getCache(key string) (bool, bool) {
 	now := time.Now()
-	m.mu.Lock(); defer m.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	v, ok := m.cache[key]
 	if !ok || now.After(v.exp) {
 		delete(m.cache, key)
@@ -251,7 +298,8 @@ func (m *CRDRuntimeManager) getCache(key string) (bool, bool) {
 }
 
 func (m *CRDRuntimeManager) setCache(clusterID, key string, served bool) {
-	m.mu.Lock(); defer m.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.cache[key] = servesCacheEntry{served: served, exp: time.Now().Add(servesCacheTTL)}
 	if m.clusterKeys[clusterID] == nil {
 		m.clusterKeys[clusterID] = map[string]struct{}{}
@@ -260,7 +308,8 @@ func (m *CRDRuntimeManager) setCache(clusterID, key string, served bool) {
 }
 
 func (m *CRDRuntimeManager) invalidateCluster(clusterID string) {
-	m.mu.Lock(); defer m.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for k := range m.clusterKeys[clusterID] {
 		delete(m.cache, k)
 	}
@@ -282,4 +331,3 @@ func result(served bool) string {
 	}
 	return "not_served"
 }
-
