@@ -28,6 +28,7 @@ import (
 	genericfilters "k8s.io/apiserver/pkg/endpoints/filters"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/server"
+	serverfilters "k8s.io/apiserver/pkg/server/filters"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/apiserver/pkg/util/webhook"
 	"k8s.io/klog/v2"
@@ -157,7 +158,10 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 						return
 					}
 					if h, err := crdRuntimeMgr.Runtime(cid, genericConfig.DrainedNotify()); err == nil && h != nil {
-						genericfilters.WithRequestInfo(h, conf.RequestInfoResolver).ServeHTTP(w, r)
+						h = genericfilters.WithRequestInfo(h, conf.RequestInfoResolver)
+						h = genericfilters.WithAuditInit(h)
+						h = serverfilters.WithPanicRecovery(h, conf.RequestInfoResolver)
+						h.ServeHTTP(w, r)
 						return
 					}
 					klog.Errorf("mc.crdRuntime unresolved at kube cluster=%s path=%s", cid, r.URL.Path)
@@ -346,7 +350,10 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 					if h, err := crdRuntimeMgr.Runtime(cid, genericConfig.DrainedNotify()); err == nil && h != nil {
 						// Ensure RequestInfo is computed from the normalized /apis path
 						// before entering the cluster-scoped CRD runtime handler.
-						genericfilters.WithRequestInfo(h, conf.RequestInfoResolver).ServeHTTP(w, r)
+						h = genericfilters.WithRequestInfo(h, conf.RequestInfoResolver)
+						h = genericfilters.WithAuditInit(h)
+						h = serverfilters.WithPanicRecovery(h, conf.RequestInfoResolver)
+						h.ServeHTTP(w, r)
 						return
 					}
 					klog.Errorf("mc.crdRuntime unresolved cluster=%s path=%s", cid, r.URL.Path)
@@ -395,7 +402,10 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 					}
 					if served {
 						if h, err := crdRuntimeMgr.Runtime(cid, genericConfig.DrainedNotify()); err == nil && h != nil {
-							genericfilters.WithRequestInfo(h, conf.RequestInfoResolver).ServeHTTP(w, r)
+							h = genericfilters.WithRequestInfo(h, conf.RequestInfoResolver)
+							h = genericfilters.WithAuditInit(h)
+							h = serverfilters.WithPanicRecovery(h, conf.RequestInfoResolver)
+							h.ServeHTTP(w, r)
 							return
 						}
 						klog.Errorf("mc.crdRuntime unresolved at aggregator cluster=%s path=%s", cid, r.URL.Path)

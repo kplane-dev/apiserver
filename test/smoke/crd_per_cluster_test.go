@@ -2,6 +2,7 @@ package smoke
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -166,6 +168,46 @@ func TestCRDResourceCRUDPerClusterIsolation(t *testing.T) {
 	}
 }
 
+func TestCRDStatusSubresourcePatchPerCluster(t *testing.T) {
+	etcd := os.Getenv("ETCD_ENDPOINTS")
+	s := startAPIServer(t, etcd)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	clusterID := "c-" + randSuffix(3)
+	group := fmt.Sprintf("status-%s.kplane.dev", randSuffix(3))
+	plural := "controlplaneregistrations"
+	crdName := plural + "." + group
+	gvr := schema.GroupVersionResource{Group: group, Version: "v1", Resource: plural}
+	namespace := "default"
+
+	crdClient := apixClientForCluster(t, s, clusterID)
+	kubeClient := kubeClientForCluster(t, s, clusterID)
+	dyn := dynamicClientForCluster(t, s, clusterID)
+
+	if err := waitForNamespace(ctx, kubeClient, namespace); err != nil {
+		t.Fatalf("cluster=%s wait namespace %s: %v", clusterID, namespace, err)
+	}
+
+	createTestCRDWithStatusSubresource(ctx, t, crdClient, crdName, group, plural, "ControlPlaneRegistration", "ControlPlaneRegistrationList")
+	waitForCRDEstablished(ctx, t, crdClient, clusterID, crdName)
+	waitForResourcePresence(t, kubeClient, clusterID, group+"/v1", plural, true)
+
+	if _, err := dyn.Resource(gvr).Namespace(namespace).Create(ctx, testCRWithStatus(group, "test-registration"), metav1.CreateOptions{}); err != nil {
+		t.Fatalf("cluster=%s create CR with status: %v", clusterID, err)
+	}
+
+	patchBody, _ := json.Marshal(map[string]any{
+		"status": map[string]any{
+			"phase": "Ready",
+		},
+	})
+	if _, err := dyn.Resource(gvr).Namespace(namespace).Patch(ctx, "test-registration", types.MergePatchType, patchBody, metav1.PatchOptions{}, "status"); err != nil {
+		t.Fatalf("cluster=%s patch status subresource failed: %v", clusterID, err)
+	}
+}
+
 func apixClientForCluster(t *testing.T, s *testAPIServer, clusterID string) *apiextensionsclient.Clientset {
 	t.Helper()
 	cfg := kubeConfigForCluster(s.clusterURL(clusterID))
@@ -201,6 +243,24 @@ func testWidget(group, name string) *unstructured.Unstructured {
 	}
 }
 
+func testCRWithStatus(group, name string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": group + "/v1",
+			"kind":       "ControlPlaneRegistration",
+			"metadata": map[string]any{
+				"name": name,
+			},
+			"spec": map[string]any{
+				"foo": "bar",
+			},
+			"status": map[string]any{
+				"phase": "Pending",
+			},
+		},
+	}
+}
+
 func createTestCRD(ctx context.Context, t *testing.T, cs *apiextensionsclient.Clientset, crdName, group, plural string) {
 	t.Helper()
 	_, err := cs.ApiextensionsV1().CustomResourceDefinitions().Create(ctx, &apiextensionsv1.CustomResourceDefinition{
@@ -228,6 +288,45 @@ func createTestCRD(ctx context.Context, t *testing.T, cs *apiextensionsclient.Cl
 	}, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("create CRD %s: %v", crdName, err)
+	}
+}
+
+func createTestCRDWithStatusSubresource(ctx context.Context, t *testing.T, cs *apiextensionsclient.Clientset, crdName, group, plural, kind, listKind string) {
+	t.Helper()
+	_, err := cs.ApiextensionsV1().CustomResourceDefinitions().Create(ctx, &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: crdName},
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+			Group: group,
+			Names: apiextensionsv1.CustomResourceDefinitionNames{
+				Plural:   plural,
+				Singular: strings.TrimSuffix(plural, "s"),
+				Kind:     kind,
+				ListKind: listKind,
+			},
+			Scope: apiextensionsv1.NamespaceScoped,
+			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
+				{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensionsv1.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensionsv1.JSONSchemaProps{
+								"spec":   {Type: "object"},
+								"status": {Type: "object"},
+							},
+						},
+					},
+					Subresources: &apiextensionsv1.CustomResourceSubresources{
+						Status: &apiextensionsv1.CustomResourceSubresourceStatus{},
+					},
+				},
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create CRD with status %s: %v", crdName, err)
 	}
 }
 
