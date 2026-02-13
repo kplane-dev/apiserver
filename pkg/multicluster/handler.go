@@ -17,7 +17,12 @@ func WithClusterRouting(next http.Handler, ex Extractor, o Options) http.Handler
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cid, all, _ := ex.Extract(r.Context(), r)
 		if cid == "" {
-			cid = o.DefaultCluster
+			if existingCID, existingAll, ok := FromContext(r.Context()); ok && existingCID != "" {
+				cid = existingCID
+				all = existingAll
+			} else {
+				cid = o.DefaultCluster
+			}
 		}
 		if o.OnClusterSelected != nil && cid != "" {
 			o.OnClusterSelected(cid)
