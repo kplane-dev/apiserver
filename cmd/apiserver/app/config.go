@@ -385,8 +385,8 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		base := server.DefaultBuildHandlerChain(h, conf)
 		dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cid, _, _ := mc.FromContext(r.Context())
-			if r.Method == http.MethodGet && cid != "" && cid != mcOpts.DefaultCluster && crdRuntimeMgr != nil {
-				if group, version, ok := exactAPIsGroupVersionDiscoveryPath(r.URL.Path); ok {
+			if cid != "" && cid != mcOpts.DefaultCluster && crdRuntimeMgr != nil {
+				if group, version, ok := apisGroupVersionFromPath(r.URL.Path); ok {
 					served, err := crdRuntimeMgr.ServesGroupVersion(cid, group, version, genericConfig.DrainedNotify())
 					if err != nil {
 						klog.Errorf("mc.crdRuntime lookup failed at aggregator cluster=%s path=%s err=%v", cid, r.URL.Path, err)
@@ -447,15 +447,4 @@ func apisGroupVersionFromPath(path string) (group, version string, ok bool) {
 	return parts[1], parts[2], true
 }
 
-func exactAPIsGroupVersionDiscoveryPath(path string) (group, version string, ok bool) {
-	group, version, ok = apisGroupVersionFromPath(path)
-	if !ok {
-		return "", "", false
-	}
-	parts := strings.Split(strings.Trim(path, "/"), "/")
-	if len(parts) != 3 {
-		return "", "", false
-	}
-	return group, version, true
-}
 
