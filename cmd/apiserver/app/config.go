@@ -18,12 +18,15 @@ package app
 
 import (
 	"net/http"
+	"strings"
+	"time"
 
 	apiextensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/admission"
 	namespaceplugin "k8s.io/apiserver/pkg/admission/plugin/namespace/lifecycle"
+	genericfilters "k8s.io/apiserver/pkg/endpoints/filters"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/server"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -121,6 +124,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	}
 	clientPool := mc.NewClientPool(genericConfig.LoopbackClientConfig, mcOpts.PathPrefix, mcOpts.ControlPlaneSegment)
 	informerPool := mc.NewInformerPoolFromClientPool(clientPool, 0, genericConfig.DrainedNotify())
+	var crdRuntimeMgr *mcbootstrap.CRDRuntimeManager
 	systemNamespaceBootstrapper := mcbootstrap.NewSystemNamespaceBootstrapper(mcbootstrap.SystemNamespaceOptions{
 		ClientForCluster: clientPool.KubeClientForCluster,
 		Namespaces:       opts.SystemNamespaces,
@@ -138,7 +142,33 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	})
 	genericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
-		return mc.WithClusterRouting(server.DefaultBuildHandlerChain(h, conf), ex, mcOpts)
+		base := server.DefaultBuildHandlerChain(h, conf)
+		dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cid, _, _ := mc.FromContext(r.Context())
+			if cid != "" && cid != mcOpts.DefaultCluster && crdRuntimeMgr != nil {
+				if group, version, ok := apisGroupVersionFromPath(r.URL.Path); ok {
+					served, err := crdRuntimeMgr.ServesGroupVersion(cid, group, version, genericConfig.DrainedNotify())
+					if err != nil {
+						klog.Errorf("mc.crdRuntime lookup failed at kube cluster=%s path=%s err=%v", cid, r.URL.Path, err)
+						http.Error(w, "cluster CRD runtime unavailable", http.StatusServiceUnavailable)
+						return
+					}
+					if !served {
+						base.ServeHTTP(w, r)
+						return
+					}
+					if h, err := crdRuntimeMgr.Runtime(cid, genericConfig.DrainedNotify()); err == nil && h != nil {
+						genericfilters.WithRequestInfo(h, conf.RequestInfoResolver).ServeHTTP(w, r)
+						return
+					}
+					klog.Errorf("mc.crdRuntime unresolved at kube cluster=%s path=%s", cid, r.URL.Path)
+					http.Error(w, "cluster CRD runtime unavailable", http.StatusServiceUnavailable)
+					return
+				}
+			}
+			base.ServeHTTP(w, r)
+		})
+		return mc.WithClusterRouting(dispatch, ex, mcOpts)
 	}
 
 	authManager := mcauth.NewManager(wait.ContextForChannel(genericConfig.DrainedNotify()), mcauth.Options{
@@ -280,10 +310,63 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	if apiExtensions.GenericConfig.RESTOptionsGetter != nil {
 		apiExtensions.GenericConfig.RESTOptionsGetter = decorateRESTOptionsGetter("apiextensions", apiExtensions.GenericConfig.RESTOptionsGetter, mcOpts)
 	}
+	crdRuntimeMgr = mcbootstrap.NewCRDRuntimeManager(mcbootstrap.CRDRuntimeManagerOptions{
+		BaseLoopbackClientConfig: apiExtensions.GenericConfig.LoopbackClientConfig,
+		PathPrefix:               mcOpts.PathPrefix,
+		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
+		DefaultCluster:           mcOpts.DefaultCluster,
+		CRDRESTOptionsGetter:     apiExtensions.ExtraConfig.CRDRESTOptionsGetter,
+		Admission:                apiExtensions.GenericConfig.AdmissionControl,
+		ServiceResolver:          apiExtensions.ExtraConfig.ServiceResolver,
+		AuthResolverWrapper:      apiExtensions.ExtraConfig.AuthResolverWrapper,
+		MasterCount:              apiExtensions.ExtraConfig.MasterCount,
+		Authorizer:               apiExtensions.GenericConfig.Authorization.Authorizer,
+		RequestTimeout:           apiExtensions.GenericConfig.RequestTimeout,
+		MinRequestTimeout:        time.Duration(apiExtensions.GenericConfig.MinRequestTimeout) * time.Second,
+		MaxRequestBodyBytes:      apiExtensions.GenericConfig.MaxRequestBodyBytes,
+	})
+	prevOnClusterSelected := mcOpts.OnClusterSelected
+	mcOpts.OnClusterSelected = func(clusterID string) {
+		if prevOnClusterSelected != nil {
+			prevOnClusterSelected(clusterID)
+		}
+		if clusterID == "" || clusterID == mcOpts.DefaultCluster {
+			return
+		}
+		_, _ = crdRuntimeMgr.Runtime(clusterID, genericConfig.DrainedNotify())
+	}
 	// Ensure CRDs are also routed through the multicluster handler
 	apiExtensions.GenericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
-		return mc.WithClusterRouting(server.DefaultBuildHandlerChain(h, conf), ex, mcOpts)
+		base := server.DefaultBuildHandlerChain(h, conf)
+		dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cid, _, _ := mc.FromContext(r.Context())
+			if cid != "" && cid != mcOpts.DefaultCluster {
+				if group, version, ok := apisGroupVersionFromPath(r.URL.Path); ok {
+					served, err := crdRuntimeMgr.ServesGroupVersion(cid, group, version, genericConfig.DrainedNotify())
+					if err != nil {
+						klog.Errorf("mc.crdRuntime lookup failed at apiextensions cluster=%s path=%s err=%v", cid, r.URL.Path, err)
+						http.Error(w, "cluster CRD runtime unavailable", http.StatusServiceUnavailable)
+						return
+					}
+					if !served {
+						base.ServeHTTP(w, r)
+						return
+					}
+					if h, err := crdRuntimeMgr.Runtime(cid, genericConfig.DrainedNotify()); err == nil && h != nil {
+						// Ensure RequestInfo is computed from the normalized /apis path
+						// before entering the cluster-scoped CRD runtime handler.
+						genericfilters.WithRequestInfo(h, conf.RequestInfoResolver).ServeHTTP(w, r)
+						return
+					}
+					klog.Errorf("mc.crdRuntime unresolved cluster=%s path=%s", cid, r.URL.Path)
+					http.Error(w, "cluster CRD runtime unavailable", http.StatusServiceUnavailable)
+					return
+				}
+			}
+			base.ServeHTTP(w, r)
+		})
+		return mc.WithClusterRouting(dispatch, ex, mcOpts)
 	}
 	// Install admission chain on apiextensions as well
 	{
@@ -309,7 +392,31 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	// Ensure aggregator also receives multicluster routing
 	aggregator.GenericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
-		return mc.WithClusterRouting(server.DefaultBuildHandlerChain(h, conf), ex, mcOpts)
+		base := server.DefaultBuildHandlerChain(h, conf)
+		dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cid, _, _ := mc.FromContext(r.Context())
+			if r.Method == http.MethodGet && cid != "" && cid != mcOpts.DefaultCluster && crdRuntimeMgr != nil {
+				if group, version, ok := exactAPIsGroupVersionDiscoveryPath(r.URL.Path); ok {
+					served, err := crdRuntimeMgr.ServesGroupVersion(cid, group, version, genericConfig.DrainedNotify())
+					if err != nil {
+						klog.Errorf("mc.crdRuntime lookup failed at aggregator cluster=%s path=%s err=%v", cid, r.URL.Path, err)
+						http.Error(w, "cluster CRD runtime unavailable", http.StatusServiceUnavailable)
+						return
+					}
+					if served {
+						if h, err := crdRuntimeMgr.Runtime(cid, genericConfig.DrainedNotify()); err == nil && h != nil {
+							genericfilters.WithRequestInfo(h, conf.RequestInfoResolver).ServeHTTP(w, r)
+							return
+						}
+						klog.Errorf("mc.crdRuntime unresolved at aggregator cluster=%s path=%s", cid, r.URL.Path)
+						http.Error(w, "cluster CRD runtime unavailable", http.StatusServiceUnavailable)
+						return
+					}
+				}
+			}
+			base.ServeHTTP(w, r)
+		})
+		return mc.WithClusterRouting(dispatch, ex, mcOpts)
 	}
 	// Install admission chain on aggregator
 	{
@@ -338,3 +445,27 @@ func decorateRESTOptionsGetter(server string, getter generic.RESTOptionsGetter, 
 	klog.Infof("mc.restOptionsGetter server=%s decorated=%t", server, true)
 	return decorated
 }
+
+func apisGroupVersionFromPath(path string) (group, version string, ok bool) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 3 || parts[0] != "apis" || parts[1] == "" || parts[2] == "" {
+		return "", "", false
+	}
+	if parts[1] == "apiextensions.k8s.io" {
+		return "", "", false
+	}
+	return parts[1], parts[2], true
+}
+
+func exactAPIsGroupVersionDiscoveryPath(path string) (group, version string, ok bool) {
+	group, version, ok = apisGroupVersionFromPath(path)
+	if !ok {
+		return "", "", false
+	}
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) != 3 {
+		return "", "", false
+	}
+	return group, version, true
+}
+
