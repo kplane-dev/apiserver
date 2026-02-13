@@ -25,6 +25,9 @@ type Options struct {
 	ClusterFieldKey      string
 	WatchStrategy        WatchStrategy
 	ClusterSource        ClusterSource
+	// OnClusterSelected is invoked by routing middleware after cluster extraction.
+	// It can be used to lazily initialize per-cluster bootstrap state.
+	OnClusterSelected func(clusterID string)
 	// ServerName identifies the apiserver instance using this options set (for metrics/logging).
 	ServerName string
 }

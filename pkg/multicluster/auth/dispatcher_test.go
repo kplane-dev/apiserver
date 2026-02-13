@@ -131,3 +131,27 @@ func TestClusterAuthorizerDispatch(t *testing.T) {
 		t.Fatalf("expected resolver to see cluster c-3, got %q", lastCluster)
 	}
 }
+
+func TestClusterAuthenticatorUsesTokenHintWithoutClusterContext(t *testing.T) {
+	var called string
+	var lastCluster string
+
+	root := &fakeAuthenticator{name: "root", called: &called}
+	cluster := &fakeAuthenticator{name: "cluster", called: &called}
+	resolver := &fakeResolver{authn: cluster, lastCluster: &lastCluster}
+	dispatch := NewClusterAuthenticator("root", root, resolver)
+
+	token := "tok-" + t.Name()
+	rememberTokenReviewHint(token, "c-42")
+
+	req := httptest.NewRequest("GET", "http://example", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	_, _, _ = dispatch.AuthenticateRequest(req)
+
+	if called != "cluster" {
+		t.Fatalf("expected cluster authenticator via token hint, got %q", called)
+	}
+	if lastCluster != "c-42" {
+		t.Fatalf("expected resolver cluster c-42, got %q", lastCluster)
+	}
+}

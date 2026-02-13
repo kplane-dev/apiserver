@@ -118,7 +118,7 @@ func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
 		return nil, fmt.Errorf("loopback informer pool is required for cluster auth")
 	}
 
-	cs, informers, _, err := m.opts.InformerPool.Get(clusterID)
+	cs, informers, stopCh, err := m.opts.InformerPool.Get(clusterID)
 	if err != nil {
 		m.mu.Unlock()
 		return nil, err
@@ -134,6 +134,7 @@ func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
 		m.mu.Unlock()
 		return nil, err
 	}
+	informers.Start(stopCh)
 
 	env := &clusterEnv{
 		cid:           clusterID,

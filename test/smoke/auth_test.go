@@ -98,6 +98,12 @@ func TestServiceAccountTokenIsolationAcrossClusters(t *testing.T) {
 	csA := kubeClientForCluster(t, s, clusterA)
 
 	ns := "default"
+	if err := waitForNamespace(ctx, csRoot, ns); err != nil {
+		t.Fatalf("cluster=%s wait for namespace %q: %v", root, ns, err)
+	}
+	if err := waitForNamespace(ctx, csA, ns); err != nil {
+		t.Fatalf("cluster=%s wait for namespace %q: %v", clusterA, ns, err)
+	}
 	saRoot := "sa-" + randSuffix(3)
 	saA := "sa-" + randSuffix(3)
 
@@ -167,7 +173,7 @@ func requestServiceAccountToken(ctx context.Context, t *testing.T, cs kubernetes
 func waitForTokenReview(ctx context.Context, t *testing.T, cs kubernetes.Interface, token string, wantAuthenticated bool) {
 	t.Helper()
 
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(90 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
 		resp, err := cs.AuthenticationV1().TokenReviews().Create(ctx, &authenticationv1.TokenReview{

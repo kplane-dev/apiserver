@@ -19,6 +19,9 @@ func WithClusterRouting(next http.Handler, ex Extractor, o Options) http.Handler
 		if cid == "" {
 			cid = o.DefaultCluster
 		}
+		if o.OnClusterSelected != nil && cid != "" {
+			o.OnClusterSelected(cid)
+		}
 		next.ServeHTTP(w, r.WithContext(WithCluster(r.Context(), cid, all)))
 	})
 }

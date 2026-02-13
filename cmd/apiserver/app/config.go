@@ -26,6 +26,7 @@ import (
 	namespaceplugin "k8s.io/apiserver/pkg/admission/plugin/namespace/lifecycle"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/server"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/apiserver/pkg/util/webhook"
 	"k8s.io/klog/v2"
 	aggregatorapiserver "k8s.io/kube-aggregator/pkg/apiserver"
@@ -34,6 +35,7 @@ import (
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/controlplane"
 	controlplaneapiserver "k8s.io/kubernetes/pkg/controlplane/apiserver"
+	"k8s.io/kubernetes/pkg/features"
 	generatedopenapi "k8s.io/kubernetes/pkg/generated/openapi"
 
 	"github.com/kplane-dev/apiserver/cmd/apiserver/app/options"
@@ -42,6 +44,7 @@ import (
 	mcnsl "github.com/kplane-dev/apiserver/pkg/multicluster/admission/namespace"
 	mcwh "github.com/kplane-dev/apiserver/pkg/multicluster/admission/webhook"
 	mcauth "github.com/kplane-dev/apiserver/pkg/multicluster/auth"
+	mcbootstrap "github.com/kplane-dev/apiserver/pkg/multicluster/bootstrap"
 )
 
 type Config struct {
@@ -118,6 +121,21 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	}
 	clientPool := mc.NewClientPool(genericConfig.LoopbackClientConfig, mcOpts.PathPrefix, mcOpts.ControlPlaneSegment)
 	informerPool := mc.NewInformerPoolFromClientPool(clientPool, 0, genericConfig.DrainedNotify())
+	systemNamespaceBootstrapper := mcbootstrap.NewSystemNamespaceBootstrapper(mcbootstrap.SystemNamespaceOptions{
+		ClientForCluster: clientPool.KubeClientForCluster,
+		Namespaces:       opts.SystemNamespaces,
+	})
+	serviceCIDRBootstrapper := mcbootstrap.NewServiceCIDRBootstrapper(mcbootstrap.ServiceCIDROptions{
+		ClientForCluster: clientPool.KubeClientForCluster,
+		PrimaryRange:     opts.PrimaryServiceClusterIPRange,
+		SecondaryRange:   opts.SecondaryServiceClusterIPRange,
+		Enabled:          utilfeature.DefaultFeatureGate.Enabled(features.MultiCIDRServiceAllocator) && opts.ServiceCIDRSharingMode == options.ServiceCIDRSharingModePerCluster,
+	})
+	rbacBootstrapper := mcbootstrap.NewRBACBootstrapper(mcbootstrap.RBACOptions{
+		BaseLoopbackClientConfig: genericConfig.LoopbackClientConfig,
+		PathPrefix:               mcOpts.PathPrefix,
+		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
+	})
 	genericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
 		return mc.WithClusterRouting(server.DefaultBuildHandlerChain(h, conf), ex, mcOpts)
@@ -178,6 +196,45 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	c.KubeAPIs = kubeAPIs
 	if c.KubeAPIs.ControlPlane.Generic.RESTOptionsGetter != nil {
 		c.KubeAPIs.ControlPlane.Generic.RESTOptionsGetter = decorateRESTOptionsGetter("controlplane", c.KubeAPIs.ControlPlane.Generic.RESTOptionsGetter, mcOpts)
+	}
+	targetPort := 443
+	if opts.SecureServing != nil && opts.SecureServing.BindPort > 0 {
+		targetPort = opts.SecureServing.BindPort
+	}
+	stopChForCluster := func(clusterID string) (<-chan struct{}, error) {
+		_, _, stopCh, err := informerPool.Get(clusterID)
+		if err != nil {
+			return nil, err
+		}
+		return stopCh, nil
+	}
+	internalControllerMgr := mcbootstrap.NewInternalControllerManager(mcbootstrap.InternalControllerOptions{
+		ClientForCluster: clientPool.KubeClientForCluster,
+		StopChForCluster: stopChForCluster,
+		ClusterAuthInfo:  kubeAPIs.ControlPlane.Extra.ClusterAuthenticationInfo,
+	})
+	kubeServiceControllerMgr := mcbootstrap.NewKubernetesServiceControllerManager(mcbootstrap.KubernetesServiceControllerOptions{
+		ClientForCluster: clientPool.KubeClientForCluster,
+		StopChForCluster: stopChForCluster,
+		PublicIP:         kubeAPIs.ControlPlane.Generic.PublicAddress,
+		ServicePort:      443,
+		TargetPort:       targetPort,
+		NodePort:         opts.KubernetesServiceNodePort,
+	})
+	mcOpts.OnClusterSelected = func(clusterID string) {
+		// Preserve upstream root bootstrap as-is; only add multicluster bootstrap for non-root VCPs.
+		if clusterID == mcOpts.DefaultCluster {
+			return
+		}
+		// Run asynchronously to avoid recursive request deadlocks when bootstrap logic
+		// uses cluster-scoped clients that route back through this same middleware.
+		go systemNamespaceBootstrapper.Ensure(clusterID)
+		go serviceCIDRBootstrapper.Ensure(clusterID)
+		go rbacBootstrapper.Ensure(clusterID)
+		go internalControllerMgr.Ensure(clusterID)
+		if opts.KubernetesServiceMode == options.KubernetesServiceModePerClusterAutoIP {
+			go kubeServiceControllerMgr.Ensure(clusterID)
+		}
 	}
 
 	// Cluster-aware webhook admission (per-cluster clients + informers, no global cross-cluster view).

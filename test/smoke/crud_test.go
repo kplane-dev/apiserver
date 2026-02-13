@@ -37,6 +37,9 @@ func TestCRUD_RandomizedAcrossClusters(t *testing.T) {
 		cs := kubeClientForCluster(t, s, cid)
 
 		ns := "default"
+		if err := waitForNamespace(ctx, cs, ns); err != nil {
+			t.Fatalf("cluster=%s wait for namespace %q: %v", cid, ns, err)
+		}
 		cmName := "cm-" + randSuffix(4)
 		_, err := cs.CoreV1().ConfigMaps(ns).Create(ctx, &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{

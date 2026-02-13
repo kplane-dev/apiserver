@@ -28,8 +28,6 @@ type informerEntry struct {
 	factory   informers.SharedInformerFactory
 	stopCh    <-chan struct{}
 	ownedCh   chan struct{}
-
-	startOnce sync.Once
 }
 
 func NewInformerPool(opts InformerPoolOptions) *InformerPool {
@@ -91,9 +89,10 @@ func (p *InformerPool) Get(clusterID string) (kubernetes.Interface, informers.Sh
 }
 
 func (e *informerEntry) start() {
-	e.startOnce.Do(func() {
-		e.factory.Start(e.stopCh)
-	})
+	// SharedInformerFactory.Start is idempotent and can be called repeatedly.
+	// Calling it on every Get ensures informers that are registered after the
+	// first Start call are also started.
+	e.factory.Start(e.stopCh)
 }
 
 func (p *InformerPool) StopCluster(clusterID string) {
