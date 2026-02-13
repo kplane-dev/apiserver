@@ -33,6 +33,8 @@ docker run --rm -p 2379:2379 -e ALLOW_NONE_AUTHENTICATION=yes -e ETCD_ADVERTISE_
   --allow-privileged=true \
   --authorization-mode=AlwaysAllow \
   --anonymous-auth=true \
+  --service-cidr-sharing-mode=per-cluster \
+  --kubernetes-service-mode=per-cluster-autoip \
   --secure-port=6443
 ```
 
@@ -54,6 +56,30 @@ You can change its name with:
 When changed, the readiness path becomes:
 ```
 https://127.0.0.1:6443/clusters/default/control-plane/readyz
+```
+
+#### Multicluster flags
+These flags control control-plane topology behavior. They are optional because
+the server defaults to per-cluster behavior.
+
+- `--root-control-plane-name` (default: `root`): name of the root control
+  plane used for default routing and root-level configuration.
+- `--service-cidr-sharing-mode` (default: `per-cluster`): service CIDR
+  bootstrap mode.
+  - `per-cluster`: bootstrap a default `ServiceCIDR` per virtual control plane.
+  - `shared`: keep only root-managed upstream behavior.
+- `--kubernetes-service-mode` (default: `per-cluster-autoip`): `default/kubernetes`
+  service behavior.
+  - `per-cluster-autoip`: reconcile `default/kubernetes` in each virtual control
+    plane with allocator-assigned ClusterIP.
+  - `shared`: keep only root-managed upstream behavior.
+
+Example shared mode:
+```bash
+./apiserver \
+  ... \
+  --service-cidr-sharing-mode=shared \
+  --kubernetes-service-mode=shared
 ```
 
 #### Webhooks

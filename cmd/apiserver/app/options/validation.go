@@ -119,6 +119,24 @@ func validateRootControlPlaneName(name string) []error {
 	return errs
 }
 
+func validateServiceCIDRSharingMode(mode string) []error {
+	switch mode {
+	case ServiceCIDRSharingModeShared, ServiceCIDRSharingModePerCluster:
+		return nil
+	default:
+		return []error{fmt.Errorf("--service-cidr-sharing-mode must be one of %q or %q", ServiceCIDRSharingModeShared, ServiceCIDRSharingModePerCluster)}
+	}
+}
+
+func validateKubernetesServiceMode(mode string) []error {
+	switch mode {
+	case KubernetesServiceModeShared, KubernetesServiceModePerClusterAutoIP:
+		return nil
+	default:
+		return []error{fmt.Errorf("--kubernetes-service-mode must be one of %q or %q", KubernetesServiceModeShared, KubernetesServiceModePerClusterAutoIP)}
+	}
+}
+
 func validatePublicIPServiceClusterIPRangeIPFamilies(extra Extra, generic genericoptions.ServerRunOptions) []error {
 	// The "kubernetes.default" Service is SingleStack based on the configured ServiceIPRange.
 	// If the bootstrap controller reconcile the kubernetes.default Service and Endpoints, it must
@@ -146,6 +164,8 @@ func (s CompletedOptions) Validate() []error {
 	errs = append(errs, validateClusterIPFlags(s.Extra)...)
 	errs = append(errs, validateServiceNodePort(s.Extra)...)
 	errs = append(errs, validateRootControlPlaneName(s.RootControlPlaneName)...)
+	errs = append(errs, validateKubernetesServiceMode(s.KubernetesServiceMode)...)
+	errs = append(errs, validateServiceCIDRSharingMode(s.ServiceCIDRSharingMode)...)
 	errs = append(errs, validatePublicIPServiceClusterIPRangeIPFamilies(s.Extra, *s.GenericServerRunOptions)...)
 
 	if s.MasterCount <= 0 {

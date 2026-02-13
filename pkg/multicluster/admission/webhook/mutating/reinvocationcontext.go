@@ -19,6 +19,7 @@ package mutating
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"reflect"
 	"sync"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -76,6 +77,13 @@ func (c *webhookReinvokeContext) ShouldReinvokeWebhook(uid string) bool {
 }
 
 func objHash(obj runtime.Object) string {
+	if obj == nil {
+		return ""
+	}
+	v := reflect.ValueOf(obj)
+	if v.Kind() == reflect.Pointer && v.IsNil() {
+		return ""
+	}
 	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
 	if err != nil {
 		return ""

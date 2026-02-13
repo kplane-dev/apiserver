@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
@@ -41,6 +42,11 @@ func (c *ClusterAuthenticator) AuthenticateRequest(req *http.Request) (*authenti
 		return nil, false, nil
 	}
 	cid := clusterFromContext(req.Context())
+	if cid == "" {
+		if token := bearerTokenFromAuthHeader(req.Header.Get("Authorization")); token != "" {
+			cid = clusterHintForToken(token)
+		}
+	}
 	useRoot := cid == "" || cid == c.rootCluster
 	if useRoot && c.root != nil {
 		return c.root.AuthenticateRequest(req)
@@ -125,4 +131,13 @@ func (c *ClusterAuthorizer) RulesFor(ctx context.Context, u user.Info, namespace
 func clusterFromContext(ctx context.Context) string {
 	cid, _, _ := mc.FromContext(ctx)
 	return cid
+}
+
+func bearerTokenFromAuthHeader(authz string) string {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(authz, prefix) {
+		return ""
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(authz, prefix))
+	return token
 }

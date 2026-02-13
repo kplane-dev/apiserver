@@ -47,7 +47,9 @@ type Extra struct {
 	AllowPrivileged           bool
 	KubeletConfig             kubeletclient.KubeletClientConfig
 	KubernetesServiceNodePort int
+	KubernetesServiceMode     string
 	RootControlPlaneName      string
+	ServiceCIDRSharingMode    string
 	// ServiceClusterIPRange is mapped to input provided by user
 	ServiceClusterIPRanges string
 	// PrimaryServiceClusterIPRange and SecondaryServiceClusterIPRange are the results
@@ -63,6 +65,13 @@ type Extra struct {
 
 	MasterCount int
 }
+
+const (
+	ServiceCIDRSharingModeShared          = "shared"
+	ServiceCIDRSharingModePerCluster      = "per-cluster"
+	KubernetesServiceModeShared           = "shared"
+	KubernetesServiceModePerClusterAutoIP = "per-cluster-autoip"
+)
 
 // NewServerRunOptions creates and returns ServerRunOptions according to the given featureGate and effectiveVersion of the server binary to run.
 func NewServerRunOptions() *ServerRunOptions {
@@ -88,9 +97,11 @@ func NewServerRunOptions() *ServerRunOptions {
 				},
 				HTTPTimeout: time.Duration(5) * time.Second,
 			},
-			ServiceNodePortRange: kubeoptions.DefaultServiceNodePortRange,
-			MasterCount:          1,
-			RootControlPlaneName: mc.DefaultClusterName,
+			ServiceNodePortRange:   kubeoptions.DefaultServiceNodePortRange,
+			MasterCount:            1,
+			RootControlPlaneName:   mc.DefaultClusterName,
+			KubernetesServiceMode:  KubernetesServiceModePerClusterAutoIP,
+			ServiceCIDRSharingMode: ServiceCIDRSharingModePerCluster,
 		},
 	}
 
@@ -108,6 +119,10 @@ func (s *ServerRunOptions) Flags() (fss cliflag.NamedFlagSets) {
 	mcfs := fss.FlagSet("multicluster")
 	mcfs.StringVar(&s.RootControlPlaneName, "root-control-plane-name", s.RootControlPlaneName,
 		"Name of the root control plane that receives CLI flag configuration and is used for default cluster routing.")
+	mcfs.StringVar(&s.KubernetesServiceMode, "kubernetes-service-mode", s.KubernetesServiceMode,
+		"Kubernetes default service strategy across control planes: 'shared' (upstream root-only) or 'per-cluster-autoip' (create/reconcile default/kubernetes in each virtual control plane with allocator-assigned ClusterIP).")
+	mcfs.StringVar(&s.ServiceCIDRSharingMode, "service-cidr-sharing-mode", s.ServiceCIDRSharingMode,
+		"Service CIDR strategy across control planes: 'shared' keeps root-managed defaults only; 'per-cluster' bootstraps default ServiceCIDR in each virtual control plane.")
 
 	fs := fss.FlagSet("misc")
 

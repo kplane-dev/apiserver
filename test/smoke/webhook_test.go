@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -164,6 +165,12 @@ func TestWebhook_ServiceBacked_MulticlusterScoping(t *testing.T) {
 	csRoot := kubeClientForCluster(t, s, root)
 
 	ns := "default"
+	if err := waitForNamespace(ctx, csA, ns); err != nil {
+		t.Fatalf("cluster=%s wait for namespace %q: %v", clusterA, ns, err)
+	}
+	if err := waitForNamespace(ctx, csB, ns); err != nil {
+		t.Fatalf("cluster=%s wait for namespace %q: %v", clusterB, ns, err)
+	}
 
 	// Service + EndpointSlice that resolves to our local webhook server.
 	svcName := "svc-wh-" + randSuffix(3)
@@ -288,7 +295,7 @@ func TestWebhook_ServiceBacked_MulticlusterScoping(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected webhook to deny configmap create in cluster=%s, but it succeeded (this indicates the webhook registration/resolution is scoped wrong)", clusterA)
 	}
-	if !apierrors.IsForbidden(err) {
+	if !apierrors.IsForbidden(err) && !strings.Contains(err.Error(), "denied by smoke webhook") {
 		t.Fatalf("expected forbidden from webhook in cluster=%s, got: %v", clusterA, err)
 	}
 

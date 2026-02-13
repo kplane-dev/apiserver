@@ -109,6 +109,7 @@ func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
 	_ = inf.Discovery().V1().EndpointSlices().Informer()
 	_ = inf.Admissionregistration().V1().MutatingWebhookConfigurations().Informer()
 	_ = inf.Admissionregistration().V1().ValidatingWebhookConfigurations().Informer()
+	inf.Start(stopCh)
 
 	// Start informers for resources needed by webhook admission.
 	go func() {

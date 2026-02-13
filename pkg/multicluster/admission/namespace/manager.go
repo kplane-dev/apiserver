@@ -79,6 +79,7 @@ func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
 
 	// Warm the namespaces informer (used by NamespaceLifecycle).
 	_ = inf.Core().V1().Namespaces().Informer()
+	inf.Start(stopCh)
 	m.clusters[clusterID] = e
 	return e, nil
 }

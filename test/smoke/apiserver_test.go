@@ -113,6 +113,7 @@ func mustWriteTokenFile(t *testing.T, path string) string {
 
 type apiserverOptions struct {
 	rootCluster string
+	etcdPrefix  string
 	extraArgs   []string
 }
 
@@ -141,10 +142,16 @@ func startAPIServerWithOptions(t *testing.T, etcdEndpoints string, opts apiserve
 	if opts.rootCluster == "" {
 		opts.rootCluster = mc.DefaultClusterName
 	}
+	if opts.etcdPrefix == "" {
+		name := strings.ToLower(t.Name())
+		name = strings.NewReplacer("/", "-", " ", "-", "_", "-", ":", "-").Replace(name)
+		opts.etcdPrefix = fmt.Sprintf("/registry-smoke-%s-%d", name, time.Now().UnixNano())
+	}
 	s.root = opts.rootCluster
 
 	args := []string{
 		"--etcd-servers=" + etcdEndpoints,
+		"--etcd-prefix=" + opts.etcdPrefix,
 		"--cert-dir=" + filepath.Join(tmp, "certs"),
 		"--secure-port=" + fmt.Sprintf("%d", port),
 		"--enable-aggregator-routing=true",
@@ -153,7 +160,10 @@ func startAPIServerWithOptions(t *testing.T, etcdEndpoints string, opts apiserve
 		"--token-auth-file=" + mustWriteTokenFile(t, filepath.Join(tmp, "tokens.csv")),
 		"--allow-privileged=true",
 		"--service-cluster-ip-range=10.0.0.0/24",
+		"--service-cidr-sharing-mode=shared",
+		"--kubernetes-service-mode=shared",
 		"--service-account-issuer=test",
+		"--api-audiences=test,https://kubernetes.default.svc",
 		"--service-account-signing-key-file=" + mustWriteRSAKey(t, filepath.Join(tmp, "sa.key")),
 		"--service-account-key-file=" + filepath.Join(tmp, "sa.key"),
 		// reduce noise + make startup faster for tests
