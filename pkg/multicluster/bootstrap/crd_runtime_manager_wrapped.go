@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/server"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
 
@@ -22,8 +23,6 @@ import (
 
 const (
 	servesLookupTimeout = 2 * time.Second
-	servesCacheTTL      = 5 * time.Second
-	watchRetryBackoff   = 500 * time.Millisecond
 )
 
 var (
@@ -36,16 +35,12 @@ var (
 )
 
 type CRDRuntimeManagerOptions struct {
-	BaseAPIExtensionsConfig *apiextensionsapiserver.Config
-	PathPrefix              string
-	ControlPlaneSegment     string
-	DefaultCluster          string
-	Delegate                http.Handler
-}
-
-type servesCacheEntry struct {
-	served bool
-	exp    time.Time
+	BaseAPIExtensionsConfig   *apiextensionsapiserver.Config
+	APIExtensionsInformerPool *mc.APIExtensionsInformerPool
+	PathPrefix                string
+	ControlPlaneSegment       string
+	DefaultCluster            string
+	Delegate                  http.Handler
 }
 
 type runtimeEntry struct {
@@ -56,19 +51,25 @@ type runtimeEntry struct {
 
 type clusterState struct {
 	r runtimeEntry
-	c *apiextensionsclient.Clientset
+	c apiextensionsclient.Interface
 }
 
 type CRDRuntimeManager struct {
 	opts CRDRuntimeManagerOptions
 
-	mu          sync.Mutex
-	runtimes    map[string]runtimeEntry
-	clients     map[string]*apiextensionsclient.Clientset
-	started     map[string]bool
-	cache       map[string]servesCacheEntry
-	clusterKeys map[string]map[string]struct{}
-	createSF    singleflight.Group
+	mu sync.Mutex
+
+	runtimes map[string]runtimeEntry
+	clients  map[string]apiextensionsclient.Interface
+	createSF singleflight.Group
+
+	// Informer-backed serves index state.
+	informerStarted map[string]bool
+	clusterSynced   map[string]bool
+	serves          map[string]bool
+	clusterKeys     map[string]map[string]struct{}
+	crdKeys         map[string]map[string][]string
+	informerSF      singleflight.Group
 }
 
 func NewCRDRuntimeManager(opts CRDRuntimeManagerOptions) *CRDRuntimeManager {
@@ -76,12 +77,14 @@ func NewCRDRuntimeManager(opts CRDRuntimeManagerOptions) *CRDRuntimeManager {
 		legacyregistry.MustRegister(crdRuntimeCreateTotal, crdServesLookupTotal, crdServesCacheHit, crdServesCacheMiss, crdServesLookupLat)
 	})
 	return &CRDRuntimeManager{
-		opts:        opts,
-		runtimes:    map[string]runtimeEntry{},
-		clients:     map[string]*apiextensionsclient.Clientset{},
-		started:     map[string]bool{},
-		cache:       map[string]servesCacheEntry{},
-		clusterKeys: map[string]map[string]struct{}{},
+		opts:            opts,
+		runtimes:        map[string]runtimeEntry{},
+		clients:         map[string]apiextensionsclient.Interface{},
+		informerStarted: map[string]bool{},
+		clusterSynced:   map[string]bool{},
+		serves:          map[string]bool{},
+		clusterKeys:     map[string]map[string]struct{}{},
+		crdKeys:         map[string]map[string][]string{},
 	}
 }
 
@@ -102,7 +105,7 @@ func (m *CRDRuntimeManager) ServesGroupVersion(clusterID, group, version string,
 	}
 	start := time.Now()
 	key := clusterID + "\x00" + group + "\x00" + version
-	if served, ok := m.getCache(key); ok {
+	if served, ok := m.lookupFromInformerIndex(clusterID, key); ok {
 		r := result(served)
 		crdServesCacheHit.WithLabelValues(r).Inc()
 		crdServesLookupTotal.WithLabelValues(r).Inc()
@@ -111,12 +114,25 @@ func (m *CRDRuntimeManager) ServesGroupVersion(clusterID, group, version string,
 	}
 	crdServesCacheMiss.WithLabelValues("miss").Inc()
 
+	// Prefer shared informer-backed state for served checks.
+	if err := m.ensureInformerState(clusterID, stopCh); err == nil {
+		if served, ok := m.lookupFromInformerIndex(clusterID, key); ok {
+			r := result(served)
+			crdServesCacheHit.WithLabelValues(r).Inc()
+			crdServesLookupTotal.WithLabelValues(r).Inc()
+			crdServesLookupLat.WithLabelValues(r).Observe(time.Since(start).Seconds())
+			return served, nil
+		}
+	}
+
+	// Fallback to direct API list if informer state is unavailable.
 	state, err := m.ensureClusterState(clusterID, stopCh)
 	if err != nil {
 		crdServesLookupTotal.WithLabelValues("error").Inc()
 		crdServesLookupLat.WithLabelValues("error").Observe(time.Since(start).Seconds())
 		return false, err
 	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), servesLookupTimeout)
 	defer cancel()
 	list, err := state.c.ApiextensionsV1().CustomResourceDefinitions().List(ctx, metav1.ListOptions{})
@@ -142,7 +158,6 @@ func (m *CRDRuntimeManager) ServesGroupVersion(clusterID, group, version string,
 			break
 		}
 	}
-	m.setCache(clusterID, key, served)
 	r := result(served)
 	crdServesLookupTotal.WithLabelValues(r).Inc()
 	crdServesLookupLat.WithLabelValues(r).Observe(time.Since(start).Seconds())
@@ -222,10 +237,6 @@ func (m *CRDRuntimeManager) ensureClusterState(clusterID string, stopCh <-chan s
 		m.mu.Lock()
 		m.runtimes[clusterID] = entry
 		m.clients[clusterID] = cs
-		if !m.started[clusterID] {
-			m.started[clusterID] = true
-			go m.watchUpdates(clusterID, cs, stopCh)
-		}
 		m.mu.Unlock()
 
 		crdRuntimeCreateTotal.WithLabelValues("success").Inc()
@@ -241,79 +252,182 @@ func (m *CRDRuntimeManager) ensureClusterState(clusterID string, stopCh <-chan s
 	return state, nil
 }
 
-func (m *CRDRuntimeManager) watchUpdates(clusterID string, cs *apiextensionsclient.Clientset, stopCh <-chan struct{}) {
-	for {
-		select {
-		case <-stopCh:
-			return
-		default:
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		w, err := cs.ApiextensionsV1().CustomResourceDefinitions().Watch(ctx, metav1.ListOptions{AllowWatchBookmarks: true, ResourceVersion: "0"})
-		if err != nil {
-			cancel()
-			select {
-			case <-stopCh:
-				return
-			case <-time.After(watchRetryBackoff):
-				continue
-			}
-		}
-		m.invalidateCluster(clusterID)
-		closed := false
-		for !closed {
-			select {
-			case <-stopCh:
-				w.Stop()
-				cancel()
-				return
-			case _, ok := <-w.ResultChan():
-				if !ok {
-					closed = true
-					break
-				}
-				m.invalidateCluster(clusterID)
-			}
-		}
-		w.Stop()
-		cancel()
-		select {
-		case <-stopCh:
-			return
-		case <-time.After(watchRetryBackoff):
-		}
-	}
-}
-
-func (m *CRDRuntimeManager) getCache(key string) (bool, bool) {
-	now := time.Now()
+func (m *CRDRuntimeManager) lookupFromInformerIndex(clusterID, key string) (bool, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	v, ok := m.cache[key]
-	if !ok || now.After(v.exp) {
-		delete(m.cache, key)
+	if !m.clusterSynced[clusterID] {
 		return false, false
 	}
-	return v.served, true
+	_, served := m.serves[key]
+	return served, true
 }
 
-func (m *CRDRuntimeManager) setCache(clusterID, key string, served bool) {
+func (m *CRDRuntimeManager) ensureInformerState(clusterID string, stopCh <-chan struct{}) error {
+	if m.opts.APIExtensionsInformerPool == nil {
+		return fmt.Errorf("apiextensions informer pool not configured")
+	}
+	m.mu.Lock()
+	if m.informerStarted[clusterID] && m.clusterSynced[clusterID] {
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Unlock()
+
+	_, err, _ := m.informerSF.Do(clusterID, func() (any, error) {
+		m.mu.Lock()
+		if m.informerStarted[clusterID] && m.clusterSynced[clusterID] {
+			m.mu.Unlock()
+			return nil, nil
+		}
+		m.mu.Unlock()
+
+		cs, factory, poolStopCh, err := m.opts.APIExtensionsInformerPool.Get(clusterID)
+		if err != nil {
+			return nil, err
+		}
+		crdInformer := factory.Apiextensions().V1().CustomResourceDefinitions().Informer()
+		_, err = crdInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				m.onCRDUpsert(clusterID, obj)
+			},
+			UpdateFunc: func(_, newObj interface{}) {
+				m.onCRDUpsert(clusterID, newObj)
+			},
+			DeleteFunc: func(obj interface{}) {
+				m.onCRDDelete(clusterID, obj)
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		stop := poolStopCh
+		if stop == nil {
+			stop = stopCh
+		}
+		if stop == nil {
+			return nil, fmt.Errorf("missing stop channel for apiextensions informer")
+		}
+		factory.Start(stop)
+		if !cache.WaitForCacheSync(stop, crdInformer.HasSynced) {
+			return nil, fmt.Errorf("failed waiting for CRD informer sync for cluster=%s", clusterID)
+		}
+
+		m.rebuildClusterIndex(clusterID, crdInformer.GetStore().List())
+
+		m.mu.Lock()
+		m.informerStarted[clusterID] = true
+		m.clusterSynced[clusterID] = true
+		if _, ok := m.clients[clusterID]; !ok {
+			m.clients[clusterID] = cs
+		}
+		m.mu.Unlock()
+		return nil, nil
+	})
+	return err
+}
+
+func (m *CRDRuntimeManager) rebuildClusterIndex(clusterID string, objs []interface{}) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.cache[key] = servesCacheEntry{served: served, exp: time.Now().Add(servesCacheTTL)}
+
+	for k := range m.clusterKeys[clusterID] {
+		delete(m.serves, k)
+	}
+	m.clusterKeys[clusterID] = map[string]struct{}{}
+	m.crdKeys[clusterID] = map[string][]string{}
+
+	for _, obj := range objs {
+		crd, ok := crdFromObj(obj)
+		if !ok {
+			continue
+		}
+		keys := servedKeysForCRD(clusterID, crd)
+		m.setCRDKeysLocked(clusterID, crd.Name, keys)
+	}
+}
+
+func (m *CRDRuntimeManager) onCRDUpsert(clusterID string, obj interface{}) {
+	crd, ok := crdFromObj(obj)
+	if !ok {
+		return
+	}
+	keys := servedKeysForCRD(clusterID, crd)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.setCRDKeysLocked(clusterID, crd.Name, keys)
+}
+
+func (m *CRDRuntimeManager) onCRDDelete(clusterID string, obj interface{}) {
+	crd, ok := crdFromObj(obj)
+	if !ok {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.setCRDKeysLocked(clusterID, crd.Name, nil)
+}
+
+func (m *CRDRuntimeManager) setCRDKeysLocked(clusterID, crdName string, keys []string) {
 	if m.clusterKeys[clusterID] == nil {
 		m.clusterKeys[clusterID] = map[string]struct{}{}
 	}
-	m.clusterKeys[clusterID][key] = struct{}{}
+	if m.crdKeys[clusterID] == nil {
+		m.crdKeys[clusterID] = map[string][]string{}
+	}
+	for _, old := range m.crdKeys[clusterID][crdName] {
+		delete(m.serves, old)
+		delete(m.clusterKeys[clusterID], old)
+	}
+	if len(keys) == 0 {
+		delete(m.crdKeys[clusterID], crdName)
+		return
+	}
+	m.crdKeys[clusterID][crdName] = keys
+	for _, k := range keys {
+		m.serves[k] = true
+		m.clusterKeys[clusterID][k] = struct{}{}
+	}
+}
+
+func servedKeysForCRD(clusterID string, crd *apiextensionsv1.CustomResourceDefinition) []string {
+	if crd == nil || !isCRDEstablished(crd) {
+		return nil
+	}
+	keys := make([]string, 0, len(crd.Spec.Versions))
+	for _, v := range crd.Spec.Versions {
+		if !v.Served {
+			continue
+		}
+		keys = append(keys, clusterID+"\x00"+crd.Spec.Group+"\x00"+v.Name)
+	}
+	return keys
+}
+
+func crdFromObj(obj interface{}) (*apiextensionsv1.CustomResourceDefinition, bool) {
+	if obj == nil {
+		return nil, false
+	}
+	if crd, ok := obj.(*apiextensionsv1.CustomResourceDefinition); ok {
+		return crd, true
+	}
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		if crd, ok := tombstone.Obj.(*apiextensionsv1.CustomResourceDefinition); ok {
+			return crd, true
+		}
+	}
+	return nil, false
 }
 
 func (m *CRDRuntimeManager) invalidateCluster(clusterID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for k := range m.clusterKeys[clusterID] {
-		delete(m.cache, k)
+		delete(m.serves, k)
 	}
 	delete(m.clusterKeys, clusterID)
+	delete(m.crdKeys, clusterID)
+	delete(m.clusterSynced, clusterID)
 }
 
 func isCRDEstablished(crd *apiextensionsv1.CustomResourceDefinition) bool {
