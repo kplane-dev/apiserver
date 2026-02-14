@@ -313,11 +313,14 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	if apiExtensions.GenericConfig.RESTOptionsGetter != nil {
 		apiExtensions.GenericConfig.RESTOptionsGetter = decorateRESTOptionsGetter("apiextensions", apiExtensions.GenericConfig.RESTOptionsGetter, mcOpts)
 	}
+	apiExtensionsClientPool := mc.NewAPIExtensionsClientPool(apiExtensions.GenericConfig.LoopbackClientConfig, mcOpts.PathPrefix, mcOpts.ControlPlaneSegment)
+	apiExtensionsInformerPool := mc.NewAPIExtensionsInformerPoolFromClientPool(apiExtensionsClientPool, 0, genericConfig.DrainedNotify())
 	crdRuntimeMgr = mcbootstrap.NewCRDRuntimeManager(mcbootstrap.CRDRuntimeManagerOptions{
-		BaseAPIExtensionsConfig: apiExtensions,
-		PathPrefix:              mcOpts.PathPrefix,
-		ControlPlaneSegment:     mcOpts.ControlPlaneSegment,
-		DefaultCluster:          mcOpts.DefaultCluster,
+		BaseAPIExtensionsConfig:   apiExtensions,
+		APIExtensionsInformerPool: apiExtensionsInformerPool,
+		PathPrefix:                mcOpts.PathPrefix,
+		ControlPlaneSegment:       mcOpts.ControlPlaneSegment,
+		DefaultCluster:            mcOpts.DefaultCluster,
 	})
 	prevOnClusterSelected := mcOpts.OnClusterSelected
 	mcOpts.OnClusterSelected = func(clusterID string) {
@@ -456,5 +459,3 @@ func apisGroupVersionFromPath(path string) (group, version string, ok bool) {
 	}
 	return parts[1], parts[2], true
 }
-
-
