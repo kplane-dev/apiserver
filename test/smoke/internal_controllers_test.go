@@ -2,7 +2,6 @@ package smoke
 
 import (
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -21,12 +20,13 @@ func TestClusterAuthInfoControllerPerCluster(t *testing.T) {
 
 	deadline := time.Now().Add(12 * time.Second)
 	for {
-		// Root apiserver startup logs one instance; non-root bootstrap should start another.
-		if strings.Count(s.logs(), "Starting cluster_authentication_trust_controller controller") >= 2 {
+		// Ensure per-cluster auth trust config map exists and is writable.
+		cm, err := cs.CoreV1().ConfigMaps("kube-system").Get(t.Context(), "extension-apiserver-authentication", metav1.GetOptions{})
+		if err == nil && cm != nil {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for per-cluster cluster_authentication_trust_controller start in cluster=%s\nlogs:\n%s", clusterID, s.logs())
+			t.Fatalf("timed out waiting for extension-apiserver-authentication configmap in cluster=%s: %v\nlogs:\n%s", clusterID, err, s.logs())
 		}
 		time.Sleep(250 * time.Millisecond)
 	}

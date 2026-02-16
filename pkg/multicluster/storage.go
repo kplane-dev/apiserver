@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -24,6 +25,8 @@ import (
 
 	"k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
+
+	"github.com/kplane-dev/apiserver/pkg/multicluster/internalcap"
 )
 
 // RESTOptionsDecorator wraps the underlying getter to inject a decorator that
@@ -45,6 +48,12 @@ var (
 		Help: "Number of base storage decorator invocations by server and resource prefix.",
 	}, []string{"server", "resourcePrefix"})
 	debugStoreAndKey = os.Getenv("MC_STOREANDKEY_DEBUG") == "1"
+
+	// ErrAllClustersScopeForbidden is returned when all-clusters scope is requested
+	// without trusted internal capability.
+	ErrAllClustersScopeForbidden = errors.New("all-clusters scope is internal-only")
+	// ErrAllClustersMutationForbidden is returned when write operations attempt all-clusters scope.
+	ErrAllClustersMutationForbidden = errors.New("mutating operations are not allowed for all-clusters scope")
 )
 
 func init() {
@@ -161,6 +170,10 @@ func (c *clusteredStorage) Versioner() storage.Versioner {
 }
 
 func (c *clusteredStorage) Create(ctx context.Context, key string, obj, out runtime.Object, ttl uint64) error {
+	if err := c.rejectAllClustersMutation(ctx); err != nil {
+		return err
+	}
+	c.enforceObjectClusterLabel(obj, c.clusterFromContext(ctx))
 	store, key, err := c.storeAndKey(ctx, key)
 	if err != nil {
 		return err
@@ -169,6 +182,9 @@ func (c *clusteredStorage) Create(ctx context.Context, key string, obj, out runt
 }
 
 func (c *clusteredStorage) Delete(ctx context.Context, key string, out runtime.Object, preconditions *storage.Preconditions, validateDeletion storage.ValidateObjectFunc, cachedExistingObject runtime.Object, opts storage.DeleteOptions) error {
+	if err := c.rejectAllClustersMutation(ctx); err != nil {
+		return err
+	}
 	store, key, err := c.storeAndKey(ctx, key)
 	if err != nil {
 		return err
@@ -201,11 +217,23 @@ func (c *clusteredStorage) GetList(ctx context.Context, key string, opts storage
 }
 
 func (c *clusteredStorage) GuaranteedUpdate(ctx context.Context, key string, destination runtime.Object, ignoreNotFound bool, precond *storage.Preconditions, tryUpdate storage.UpdateFunc, cachedExistingObject runtime.Object) error {
+	if err := c.rejectAllClustersMutation(ctx); err != nil {
+		return err
+	}
 	store, key, err := c.storeAndKey(ctx, key)
 	if err != nil {
 		return err
 	}
-	return store.GuaranteedUpdate(ctx, key, destination, ignoreNotFound, precond, tryUpdate, cachedExistingObject)
+	cid := c.clusterFromContext(ctx)
+	wrappedUpdate := func(input runtime.Object, res storage.ResponseMeta) (runtime.Object, *uint64, error) {
+		outObj, ttl, err := tryUpdate(input, res)
+		if err != nil || outObj == nil {
+			return outObj, ttl, err
+		}
+		c.enforceObjectClusterLabel(outObj, cid)
+		return outObj, ttl, nil
+	}
+	return store.GuaranteedUpdate(ctx, key, destination, ignoreNotFound, precond, wrappedUpdate, cachedExistingObject)
 }
 
 func (c *clusteredStorage) Stats(ctx context.Context) (storage.Stats, error) {
@@ -265,7 +293,11 @@ func (c *clusteredStorage) destroy() {
 }
 
 func (c *clusteredStorage) storeAndKey(ctx context.Context, key string) (storage.Interface, string, error) {
-	cid, all, _ := FromContext(ctx)
+	cid, scope, _ := FromContextScope(ctx)
+	if scope != ResourceScopeCrossClusterRead && HasInternalCrossClusterCapability(ctx) {
+		scope = ResourceScopeCrossClusterRead
+		ctx = internalcap.WithAllClustersCapability(ctx)
+	}
 	if cid == "" {
 		cid = c.defaultCluster()
 	}
@@ -273,12 +305,15 @@ func (c *clusteredStorage) storeAndKey(ctx context.Context, key string) (storage
 	if err != nil {
 		return nil, key, err
 	}
-	if all {
+	if scope == ResourceScopeCrossClusterRead {
+		if !internalcap.HasAllClustersCapability(ctx) {
+			return nil, key, ErrAllClustersScopeForbidden
+		}
 		rewritten := c.kindRootPrefix()
 		fullKey := strings.TrimSuffix(c.config.Prefix, "/") + "/" + strings.TrimPrefix(rewritten, "/")
 		if debugStoreAndKey {
-			fmt.Fprintf(os.Stderr, "mc.storeAndKey all=true store=%T/%p resourcePrefix=%s key=%s cid=%s rewritten=%s etcdPrefix=%s fullKey=%s\n",
-				store, store, c.resourcePrefix, key, cid, rewritten, c.config.Prefix, fullKey,
+			fmt.Fprintf(os.Stderr, "mc.storeAndKey scope=%s store=%T/%p resourcePrefix=%s key=%s cid=%s rewritten=%s etcdPrefix=%s fullKey=%s\n",
+				scope, store, store, c.resourcePrefix, key, cid, rewritten, c.config.Prefix, fullKey,
 			)
 		}
 		return store, rewritten, nil
@@ -286,11 +321,19 @@ func (c *clusteredStorage) storeAndKey(ctx context.Context, key string) (storage
 	rewritten := c.rewriteKey(cid, key)
 	fullKey := strings.TrimSuffix(c.config.Prefix, "/") + "/" + strings.TrimPrefix(rewritten, "/")
 	if debugStoreAndKey {
-		fmt.Fprintf(os.Stderr, "mc.storeAndKey all=false store=%T/%p resourcePrefix=%s key=%s cid=%s rewritten=%s etcdPrefix=%s fullKey=%s\n",
-			store, store, c.resourcePrefix, key, cid, rewritten, c.config.Prefix, fullKey,
+		fmt.Fprintf(os.Stderr, "mc.storeAndKey scope=%s store=%T/%p resourcePrefix=%s key=%s cid=%s rewritten=%s etcdPrefix=%s fullKey=%s\n",
+			scope, store, store, c.resourcePrefix, key, cid, rewritten, c.config.Prefix, fullKey,
 		)
 	}
 	return store, rewritten, nil
+}
+
+func (c *clusteredStorage) rejectAllClustersMutation(ctx context.Context) error {
+	_, scope, _ := FromContextScope(ctx)
+	if scope == ResourceScopeCrossClusterRead {
+		return ErrAllClustersMutationForbidden
+	}
+	return nil
 }
 
 func (c *clusteredStorage) defaultCluster() string {
@@ -298,6 +341,34 @@ func (c *clusteredStorage) defaultCluster() string {
 		return c.options.DefaultCluster
 	}
 	return DefaultClusterName
+}
+
+func (c *clusteredStorage) clusterFromContext(ctx context.Context) string {
+	cid, _, _ := FromContextScope(ctx)
+	if cid == "" {
+		cid = c.defaultCluster()
+	}
+	return cid
+}
+
+func (c *clusteredStorage) enforceObjectClusterLabel(obj runtime.Object, cid string) {
+	if obj == nil {
+		return
+	}
+	acc, err := meta.Accessor(obj)
+	if err != nil {
+		return
+	}
+	key := c.options.ClusterAnnotationKey
+	if key == "" {
+		key = DefaultClusterAnnotation
+	}
+	lbls := acc.GetLabels()
+	if lbls == nil {
+		lbls = map[string]string{}
+	}
+	lbls[key] = cid
+	acc.SetLabels(lbls)
 }
 
 func (c *clusteredStorage) clusterFromObject(obj runtime.Object) string {

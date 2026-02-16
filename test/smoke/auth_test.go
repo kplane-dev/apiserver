@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -46,6 +47,11 @@ func TestRBACIsolationAcrossClusters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cluster=%s create clusterrole: %v", clusterA, err)
 	}
+	if got, getErr := csA.RbacV1().ClusterRoles().Get(ctx, roleName, metav1.GetOptions{}); getErr != nil {
+		t.Fatalf("cluster=%s get clusterrole: %v", clusterA, getErr)
+	} else if got.Labels[mc.DefaultClusterAnnotation] != clusterA {
+		t.Fatalf("cluster=%s clusterrole missing label %q=%q labels=%v", clusterA, mc.DefaultClusterAnnotation, clusterA, got.Labels)
+	}
 	t.Cleanup(func() {
 		_ = csA.RbacV1().ClusterRoles().Delete(context.Background(), roleName, metav1.DeleteOptions{})
 	})
@@ -64,6 +70,11 @@ func TestRBACIsolationAcrossClusters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cluster=%s create clusterrolebinding: %v", clusterA, err)
 	}
+	if got, getErr := csA.RbacV1().ClusterRoleBindings().Get(ctx, bindingName, metav1.GetOptions{}); getErr != nil {
+		t.Fatalf("cluster=%s get clusterrolebinding: %v", clusterA, getErr)
+	} else if got.Labels[mc.DefaultClusterAnnotation] != clusterA {
+		t.Fatalf("cluster=%s clusterrolebinding missing label %q=%q labels=%v", clusterA, mc.DefaultClusterAnnotation, clusterA, got.Labels)
+	}
 	t.Cleanup(func() {
 		_ = csA.RbacV1().ClusterRoleBindings().Delete(context.Background(), bindingName, metav1.DeleteOptions{})
 	})
@@ -80,8 +91,8 @@ func TestRBACIsolationAcrossClusters(t *testing.T) {
 		},
 	}
 
-	waitForSubjectAccessReview(ctx, t, csA, sar, true)
-	waitForSubjectAccessReview(ctx, t, csRoot, sar, false)
+	waitForSubjectAccessReviewWithLogs(ctx, t, csA, sar, true, s.logs)
+	waitForSubjectAccessReviewWithLogs(ctx, t, csRoot, sar, false, s.logs)
 }
 
 func TestServiceAccountTokenIsolationAcrossClusters(t *testing.T) {
@@ -130,6 +141,35 @@ func TestServiceAccountTokenIsolationAcrossClusters(t *testing.T) {
 	waitForTokenReview(ctx, t, csA, tokenRoot, false)
 }
 
+func TestRBACCreateSetsClusterLabel(t *testing.T) {
+	etcd := os.Getenv("ETCD_ENDPOINTS")
+	s := startAPIServer(t, etcd)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	clusterA := "c-" + randSuffix(3)
+	csA := kubeClientForCluster(t, s, clusterA)
+	roleName := "role-" + randSuffix(4)
+
+	obj, err := csA.RbacV1().ClusterRoles().Create(ctx, &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: roleName},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"configmaps"},
+				Verbs:     []string{"get"},
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("cluster=%s create clusterrole: %v", clusterA, err)
+	}
+	if obj.Labels[mc.DefaultClusterAnnotation] != clusterA {
+		t.Fatalf("expected cluster label %q=%q, got labels=%v", mc.DefaultClusterAnnotation, clusterA, obj.Labels)
+	}
+}
+
 func waitForSubjectAccessReview(ctx context.Context, t *testing.T, cs kubernetes.Interface, sar *authorizationv1.SubjectAccessReview, wantAllowed bool) {
 	t.Helper()
 
@@ -150,6 +190,29 @@ func waitForSubjectAccessReview(ctx context.Context, t *testing.T, cs kubernetes
 			}
 		}
 		time.Sleep(500 * time.Millisecond)
+	}
+	t.Fatalf("expected SAR allowed=%v, last error: %v", wantAllowed, lastErr)
+}
+
+func waitForSubjectAccessReviewWithLogs(ctx context.Context, t *testing.T, cs kubernetes.Interface, sar *authorizationv1.SubjectAccessReview, wantAllowed bool, logsFn func() string) {
+	t.Helper()
+
+	deadline := time.Now().Add(30 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := cs.AuthorizationV1().SubjectAccessReviews().Create(ctx, sar, metav1.CreateOptions{})
+		if err == nil {
+			if resp.Status.Allowed == wantAllowed {
+				return
+			}
+			lastErr = fmt.Errorf("allowed=%v reason=%s", resp.Status.Allowed, resp.Status.Reason)
+		} else {
+			lastErr = err
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if logsFn != nil {
+		t.Fatalf("expected SAR allowed=%v, last error: %v\nlogs:\n%s", wantAllowed, lastErr, logsFn())
 	}
 	t.Fatalf("expected SAR allowed=%v, last error: %v", wantAllowed, lastErr)
 }

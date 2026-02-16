@@ -2,6 +2,8 @@ package multicluster
 
 import (
 	"net/http"
+
+	"github.com/kplane-dev/apiserver/pkg/multicluster/internalcap"
 )
 
 // WithClusterRouting wraps an http.Handler to extract cluster from the request using the provided Extractor,
@@ -15,7 +17,11 @@ func WithClusterRouting(next http.Handler, ex Extractor, o Options) http.Handler
 		o.DefaultCluster = DefaultClusterName
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cid, all, _ := ex.Extract(r.Context(), r)
+		cid, all, err := ex.Extract(r.Context(), r)
+		if err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		if cid == "" {
 			if existingCID, existingAll, ok := FromContext(r.Context()); ok && existingCID != "" {
 				cid = existingCID
@@ -27,6 +33,10 @@ func WithClusterRouting(next http.Handler, ex Extractor, o Options) http.Handler
 		if o.OnClusterSelected != nil && cid != "" {
 			o.OnClusterSelected(cid)
 		}
-		next.ServeHTTP(w, r.WithContext(WithCluster(r.Context(), cid, all)))
+		ctx := WithCluster(r.Context(), cid, all)
+		if all {
+			ctx = internalcap.WithAllClustersCapability(ctx)
+		}
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

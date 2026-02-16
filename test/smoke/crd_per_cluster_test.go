@@ -313,8 +313,18 @@ func createTestCRDWithStatusSubresource(ctx context.Context, t *testing.T, cs *a
 						OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
 							Type: "object",
 							Properties: map[string]apiextensionsv1.JSONSchemaProps{
-								"spec":   {Type: "object"},
-								"status": {Type: "object"},
+								"spec": {
+									Type: "object",
+									Properties: map[string]apiextensionsv1.JSONSchemaProps{
+										"foo": {Type: "string"},
+									},
+								},
+								"status": {
+									Type: "object",
+									Properties: map[string]apiextensionsv1.JSONSchemaProps{
+										"phase": {Type: "string"},
+									},
+								},
 							},
 						},
 					},

@@ -1,7 +1,6 @@
 package webhook
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -9,20 +8,22 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/kubernetes"
+	corelisters "k8s.io/client-go/listers/core/v1"
+	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 )
 
 type directServiceResolver struct {
-	cs                    kubernetes.Interface
+	services              corelisters.ServiceLister
+	endpointSlices        discoverylisters.EndpointSliceLister
 	enableEndpointRouting bool
 	hostname              string
 }
 
-func newDirectServiceResolver(cs kubernetes.Interface, enableEndpointRouting bool, hostname string) *directServiceResolver {
+func newDirectServiceResolver(services corelisters.ServiceLister, endpointSlices discoverylisters.EndpointSliceLister, enableEndpointRouting bool, hostname string) *directServiceResolver {
 	return &directServiceResolver{
-		cs:                    cs,
+		services:              services,
+		endpointSlices:        endpointSlices,
 		enableEndpointRouting: enableEndpointRouting,
 		hostname:              hostname,
 	}
@@ -40,8 +41,10 @@ func (r *directServiceResolver) ResolveEndpoint(namespace, name string, port int
 		}
 	}
 
-	ctx := context.Background()
-	svc, err := r.cs.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
+	if r.services == nil {
+		return nil, fmt.Errorf("service lister is not configured")
+	}
+	svc, err := r.services.Services(namespace).Get(name)
 	if err != nil {
 		return nil, err
 	}
@@ -54,14 +57,16 @@ func (r *directServiceResolver) ResolveEndpoint(namespace, name string, port int
 		return &url.URL{Scheme: "https", Host: net.JoinHostPort(ip, strconv.Itoa(int(port)))}, nil
 	}
 
+	if r.endpointSlices == nil {
+		return nil, fmt.Errorf("endpointslice lister is not configured")
+	}
 	targetName, targetPort := serviceTargetPort(svc, port)
 
-	selector := labels.Set{discoveryv1.LabelServiceName: name}.AsSelector().String()
-	slices, err := r.cs.DiscoveryV1().EndpointSlices(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	slices, err := r.endpointSlices.EndpointSlices(namespace).List(labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: name}))
 	if err != nil {
 		return nil, err
 	}
-	if len(slices.Items) == 0 {
+	if len(slices) == 0 {
 		return nil, fmt.Errorf("no endpointslices found for service %q", name)
 	}
 
@@ -70,8 +75,8 @@ func (r *directServiceResolver) ResolveEndpoint(namespace, name string, port int
 		epPort = targetPort
 	} else if targetName != "" {
 		found := false
-		for i := range slices.Items {
-			for _, p := range slices.Items[i].Ports {
+		for i := range slices {
+			for _, p := range slices[i].Ports {
 				if p.Name != nil && *p.Name == targetName && p.Port != nil {
 					epPort = *p.Port
 					found = true
@@ -84,7 +89,7 @@ func (r *directServiceResolver) ResolveEndpoint(namespace, name string, port int
 		}
 	}
 
-	addr, err := firstEndpointAddress(slices.Items)
+	addr, err := firstEndpointAddress(slices)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +113,7 @@ func serviceTargetPort(svc *corev1.Service, servicePort int32) (targetName strin
 	return "", servicePort
 }
 
-func firstEndpointAddress(slices []discoveryv1.EndpointSlice) (string, error) {
+func firstEndpointAddress(slices []*discoveryv1.EndpointSlice) (string, error) {
 	for i := range slices {
 		for _, ep := range slices[i].Endpoints {
 			ready := true

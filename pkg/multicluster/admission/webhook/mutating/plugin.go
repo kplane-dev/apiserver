@@ -22,7 +22,6 @@ import (
 
 	"github.com/kplane-dev/apiserver/pkg/multicluster/admission/webhook/generic"
 	"k8s.io/apiserver/pkg/admission"
-	"k8s.io/apiserver/pkg/admission/configuration"
 )
 
 const (
@@ -54,7 +53,7 @@ func NewMutatingWebhook(configFile io.Reader) (*Plugin, error) {
 	handler := admission.NewHandler(admission.Connect, admission.Create, admission.Delete, admission.Update)
 	p := &Plugin{}
 	var err error
-	p.Webhook, err = generic.NewWebhook(handler, configFile, configuration.NewMutatingWebhookConfigurationManager, newMutatingDispatcher(p))
+	p.Webhook, err = generic.NewWebhook(handler, configFile, generic.NewListBackedMutatingWebhookSource, newMutatingDispatcher(p))
 	if err != nil {
 		return nil, err
 	}
