@@ -3,6 +3,9 @@ package multicluster
 import (
 	"context"
 	"net/http"
+
+	"github.com/kplane-dev/apiserver/pkg/multicluster/internalcap"
+	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 )
 
 // Options holds multicluster configuration.
@@ -32,13 +35,27 @@ type Options struct {
 	ServerName string
 }
 
+// ResourceScope defines which keyspace view a request should use.
+type ResourceScope string
+
 const (
-	DefaultEtcdPrefix          = "/registry"
-	DefaultClusterName         = "root"
-	DefaultPathPrefix          = "/clusters/"
-	DefaultControlPlaneSegment = "control-plane"
-	DefaultClusterAnnotation   = "multicluster.k8s.io/cluster"
-	DefaultClusterField        = "metadata.cluster"
+	// ResourceScopeCluster scopes reads/writes to one cluster keyspace.
+	ResourceScopeCluster ResourceScope = "cluster"
+	// ResourceScopeCrossClusterRead scopes reads to the shared all-clusters keyspace.
+	// This scope is intended for internal readers only.
+	ResourceScopeCrossClusterRead ResourceScope = "cross-cluster-read"
+)
+
+const (
+	DefaultEtcdPrefix                     = "/registry"
+	DefaultClusterName                    = "root"
+	DefaultPathPrefix                     = "/clusters/"
+	DefaultControlPlaneSegment            = "control-plane"
+	DefaultInternalCrossClusterUser       = "system:apiserver"
+	DefaultInternalCrossClusterCapability = "kplane.internal/cross-cluster-read"
+	DefaultInternalCrossClusterUserAgent  = "kplane-internal-cross-cluster"
+	DefaultClusterAnnotation              = "multicluster.k8s.io/cluster"
+	DefaultClusterField                   = "metadata.cluster"
 )
 
 var DefaultOptions = Options{
@@ -52,8 +69,8 @@ var DefaultOptions = Options{
 }
 
 // Extractor extracts the cluster selection from an HTTP request/context.
-// all=false indicates the request is scoped to a single cluster (required default).
-// all=true could be reserved for special admin endpoints; not used by default.
+// all=false indicates per-cluster scope.
+// all=true maps to all-clusters scope and should only be set by trusted internal code.
 
 type Extractor interface {
 	Extract(ctx context.Context, r *http.Request) (clusterID string, all bool, err error)
@@ -150,21 +167,65 @@ func (c ComposeExtractor) Extract(ctx context.Context, r *http.Request) (string,
 type clusterContextKey struct{}
 
 type clusterSelection struct {
-	ID  string
-	All bool
+	ID    string
+	Scope ResourceScope
 }
 
 func WithCluster(ctx context.Context, id string, all bool) context.Context {
-	return context.WithValue(ctx, clusterContextKey{}, clusterSelection{ID: id, All: all})
+	scope := ResourceScopeCluster
+	if all {
+		scope = ResourceScopeCrossClusterRead
+	}
+	return WithClusterScope(ctx, id, scope)
+}
+
+func WithClusterScope(ctx context.Context, id string, scope ResourceScope) context.Context {
+	if scope == "" {
+		scope = ResourceScopeCluster
+	}
+	return context.WithValue(ctx, clusterContextKey{}, clusterSelection{ID: id, Scope: scope})
+}
+
+// WithInternalCrossClusterRead marks context for trusted internal cross-cluster reads.
+func WithInternalCrossClusterRead(ctx context.Context, id string) context.Context {
+	ctx = WithClusterScope(ctx, id, ResourceScopeCrossClusterRead)
+	return internalcap.WithAllClustersCapability(ctx)
 }
 
 func FromContext(ctx context.Context) (id string, all bool, ok bool) {
+	id, scope, ok := FromContextScope(ctx)
+	return id, scope == ResourceScopeCrossClusterRead, ok
+}
+
+func FromContextScope(ctx context.Context) (id string, scope ResourceScope, ok bool) {
 	v := ctx.Value(clusterContextKey{})
 	if v == nil {
-		return "", false, false
+		return "", ResourceScopeCluster, false
 	}
 	cs := v.(clusterSelection)
-	return cs.ID, cs.All, true
+	if cs.Scope == "" {
+		cs.Scope = ResourceScopeCluster
+	}
+	return cs.ID, cs.Scope, true
+}
+
+// HasInternalCrossClusterCapability reports whether the authenticated request user
+// is trusted for internal cross-cluster reads.
+func HasInternalCrossClusterCapability(ctx context.Context) bool {
+	u, ok := apirequest.UserFrom(ctx)
+	if !ok || u == nil || u.GetName() != DefaultInternalCrossClusterUser {
+		return false
+	}
+	extras := u.GetExtra()
+	if len(extras) == 0 {
+		return false
+	}
+	for _, v := range extras[DefaultInternalCrossClusterCapability] {
+		if v == "true" {
+			return true
+		}
+	}
+	return false
 }
 
 // Watch strategy plumbing

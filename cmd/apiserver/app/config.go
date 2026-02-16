@@ -322,6 +322,10 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		ControlPlaneSegment:       mcOpts.ControlPlaneSegment,
 		DefaultCluster:            mcOpts.DefaultCluster,
 	})
+	apiExtensions.ExtraConfig.CRDGetter = crdRuntimeMgr.CRDGetterForRequest
+	apiExtensions.ExtraConfig.CRDListerForRequest = crdRuntimeMgr.CRDListerForRequest
+	crdController := mcbootstrap.NewMulticlusterCRDController(crdRuntimeMgr, mcOpts.DefaultCluster)
+	crdController.Start(genericConfig.DrainedNotify())
 	prevOnClusterSelected := mcOpts.OnClusterSelected
 	mcOpts.OnClusterSelected = func(clusterID string) {
 		if prevOnClusterSelected != nil {
@@ -330,7 +334,37 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		if clusterID == "" || clusterID == mcOpts.DefaultCluster {
 			return
 		}
-		_, _ = crdRuntimeMgr.Runtime(clusterID, genericConfig.DrainedNotify())
+		crdController.EnsureCluster(clusterID)
+	}
+	serveClusterCRD := func(w http.ResponseWriter, r *http.Request, conf *server.Config, clusterID, caller string) bool {
+		group, version, ok := apisGroupVersionFromPath(r.URL.Path)
+		if !ok {
+			return false
+		}
+
+		served, err := crdRuntimeMgr.ServesGroupVersion(clusterID, group, version, genericConfig.DrainedNotify())
+		if err != nil {
+			klog.Errorf("mc.crdRuntime lookup failed at %s cluster=%s path=%s err=%v", caller, clusterID, r.URL.Path, err)
+			http.Error(w, "cluster CRD runtime unavailable", http.StatusServiceUnavailable)
+			return true
+		}
+		if !served {
+			return false
+		}
+
+		h, err := crdRuntimeMgr.Runtime(clusterID, genericConfig.DrainedNotify())
+		if err != nil || h == nil {
+			klog.Errorf("mc.crdRuntime unresolved at %s cluster=%s path=%s err=%v", caller, clusterID, r.URL.Path, err)
+			http.Error(w, "cluster CRD runtime unavailable", http.StatusServiceUnavailable)
+			return true
+		}
+		// Ensure RequestInfo is computed from the normalized /apis path
+		// before entering the cluster-scoped CRD runtime handler.
+		h = genericfilters.WithRequestInfo(h, conf.RequestInfoResolver)
+		h = genericfilters.WithAuditInit(h)
+		h = serverfilters.WithPanicRecovery(h, conf.RequestInfoResolver)
+		h.ServeHTTP(w, r)
+		return true
 	}
 	// Ensure CRDs are also routed through the multicluster handler
 	apiExtensions.GenericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
@@ -339,28 +373,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cid, _, _ := mc.FromContext(r.Context())
 			if cid != "" && cid != mcOpts.DefaultCluster {
-				if group, version, ok := apisGroupVersionFromPath(r.URL.Path); ok {
-					served, err := crdRuntimeMgr.ServesGroupVersion(cid, group, version, genericConfig.DrainedNotify())
-					if err != nil {
-						klog.Errorf("mc.crdRuntime lookup failed at apiextensions cluster=%s path=%s err=%v", cid, r.URL.Path, err)
-						http.Error(w, "cluster CRD runtime unavailable", http.StatusServiceUnavailable)
-						return
-					}
-					if !served {
-						base.ServeHTTP(w, r)
-						return
-					}
-					if h, err := crdRuntimeMgr.Runtime(cid, genericConfig.DrainedNotify()); err == nil && h != nil {
-						// Ensure RequestInfo is computed from the normalized /apis path
-						// before entering the cluster-scoped CRD runtime handler.
-						h = genericfilters.WithRequestInfo(h, conf.RequestInfoResolver)
-						h = genericfilters.WithAuditInit(h)
-						h = serverfilters.WithPanicRecovery(h, conf.RequestInfoResolver)
-						h.ServeHTTP(w, r)
-						return
-					}
-					klog.Errorf("mc.crdRuntime unresolved cluster=%s path=%s", cid, r.URL.Path)
-					http.Error(w, "cluster CRD runtime unavailable", http.StatusServiceUnavailable)
+				if serveClusterCRD(w, r, conf, cid, "apiextensions") {
 					return
 				}
 			}
@@ -396,25 +409,8 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cid, _, _ := mc.FromContext(r.Context())
 			if cid != "" && cid != mcOpts.DefaultCluster && crdRuntimeMgr != nil {
-				if group, version, ok := apisGroupVersionFromPath(r.URL.Path); ok {
-					served, err := crdRuntimeMgr.ServesGroupVersion(cid, group, version, genericConfig.DrainedNotify())
-					if err != nil {
-						klog.Errorf("mc.crdRuntime lookup failed at aggregator cluster=%s path=%s err=%v", cid, r.URL.Path, err)
-						http.Error(w, "cluster CRD runtime unavailable", http.StatusServiceUnavailable)
-						return
-					}
-					if served {
-						if h, err := crdRuntimeMgr.Runtime(cid, genericConfig.DrainedNotify()); err == nil && h != nil {
-							h = genericfilters.WithRequestInfo(h, conf.RequestInfoResolver)
-							h = genericfilters.WithAuditInit(h)
-							h = serverfilters.WithPanicRecovery(h, conf.RequestInfoResolver)
-							h.ServeHTTP(w, r)
-							return
-						}
-						klog.Errorf("mc.crdRuntime unresolved at aggregator cluster=%s path=%s", cid, r.URL.Path)
-						http.Error(w, "cluster CRD runtime unavailable", http.StatusServiceUnavailable)
-						return
-					}
+				if serveClusterCRD(w, r, conf, cid, "aggregator") {
+					return
 				}
 			}
 			base.ServeHTTP(w, r)
