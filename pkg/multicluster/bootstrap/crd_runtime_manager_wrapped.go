@@ -161,6 +161,9 @@ func (m *CRDRuntimeManager) ensureSharedRuntime(stopCh <-chan struct{}) (runtime
 			return nil, fmt.Errorf("base apiextensions config is required")
 		}
 		baseGeneric := *m.opts.BaseAPIExtensionsConfig.GenericConfig
+		if baseGeneric.LoopbackClientConfig != nil {
+			baseGeneric.LoopbackClientConfig = allClustersLoopbackConfig(baseGeneric.LoopbackClientConfig)
+		}
 		baseCfg := *m.opts.BaseAPIExtensionsConfig
 		baseCfg.GenericConfig = &baseGeneric
 		completed := baseCfg.Complete()
@@ -580,6 +583,11 @@ func allClustersAPIExtensionsClient(base *rest.Config) (apiextensionsclient.Inte
 	if base == nil {
 		return nil, fmt.Errorf("base loopback config is required")
 	}
+	cfg := allClustersLoopbackConfig(base)
+	return apiextensionsclient.NewForConfig(cfg)
+}
+
+func allClustersLoopbackConfig(base *rest.Config) *rest.Config {
 	cfg := rest.CopyConfig(base)
 	cfg.Impersonate.UserName = mc.DefaultInternalCrossClusterUser
 	cfg.Impersonate.Groups = []string{"system:authenticated", "system:masters"}
@@ -592,7 +600,7 @@ func allClustersAPIExtensionsClient(base *rest.Config) (apiextensionsclient.Inte
 	} else {
 		cfg.UserAgent = mc.DefaultInternalCrossClusterUserAgent + " " + cfg.UserAgent
 	}
-	return apiextensionsclient.NewForConfig(cfg)
+	return cfg
 }
 
 func (m *CRDRuntimeManager) sharedStartStopCh(stopCh <-chan struct{}) <-chan struct{} {
@@ -648,6 +656,13 @@ func encodeSharedCRDName(clusterID, name string) string {
 		return name
 	}
 	return prefix + name
+}
+
+// EncodeSharedCRDResourceName returns a cluster-unique resource token that
+// preserves the "<encodedResource>.<group>" CRD name relation used by
+// upstream CRD handler lookup.
+func EncodeSharedCRDResourceName(clusterID, resource string) string {
+	return encodeSharedCRDName(clusterID, resource)
 }
 
 func decodeSharedCRDName(clusterID, name string) string {
