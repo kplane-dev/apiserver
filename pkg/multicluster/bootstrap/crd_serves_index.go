@@ -67,6 +67,9 @@ func (i *CRDServesIndex) UpsertCRD(clusterID string, crd *apiextensionsv1.Custom
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.setCRDKeysLocked(clusterID, crd.Name, keys)
+	// New clusters often appear after the initial informer sync/rebuild.
+	// Mark as synced on first observed event to avoid false "unknown" lookups.
+	i.clusterSynced[clusterID] = true
 }
 
 func (i *CRDServesIndex) DeleteCRD(clusterID string, crd *apiextensionsv1.CustomResourceDefinition) {
@@ -76,6 +79,8 @@ func (i *CRDServesIndex) DeleteCRD(clusterID string, crd *apiextensionsv1.Custom
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.setCRDKeysLocked(clusterID, crd.Name, nil)
+	// Delete events are also a valid synchronization signal for the cluster.
+	i.clusterSynced[clusterID] = true
 }
 
 func (i *CRDServesIndex) InvalidateCluster(clusterID string) {

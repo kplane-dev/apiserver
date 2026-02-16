@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/admission"
 	namespaceplugin "k8s.io/apiserver/pkg/admission/plugin/namespace/lifecycle"
+	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 	genericfilters "k8s.io/apiserver/pkg/endpoints/filters"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/server"
@@ -363,6 +364,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		// Ensure RequestInfo is computed from the normalized /apis path
 		// before entering the cluster-scoped CRD runtime handler.
 		h = genericfilters.WithRequestInfo(h, conf.RequestInfoResolver)
+		h = withClusterCRDRequestInfoRewrite(h, clusterID)
 		h = genericfilters.WithAuditInit(h)
 		h = serverfilters.WithPanicRecovery(h, conf.RequestInfoResolver)
 		h.ServeHTTP(w, r)
@@ -459,6 +461,23 @@ func setCRDRequestResolvers(
 	} else {
 		klog.V(2).Info("apiextensions ExtraConfig has no CRDListerForRequest field; skipping request-scoped CRD lister hook")
 	}
+}
+
+func withClusterCRDRequestInfoRewrite(next http.Handler, clusterID string) http.Handler {
+	if next == nil || clusterID == "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ri, ok := apirequest.RequestInfoFrom(r.Context())
+		if !ok || ri == nil || !ri.IsResourceRequest || ri.APIGroup == "" || ri.APIGroup == "apiextensions.k8s.io" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		rewritten := *ri
+		rewritten.Resource = mcbootstrap.EncodeSharedCRDResourceName(clusterID, ri.Resource)
+		ctx := apirequest.WithRequestInfo(r.Context(), &rewritten)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 func decorateRESTOptionsGetter(server string, getter generic.RESTOptionsGetter, opts mc.Options) generic.RESTOptionsGetter {
