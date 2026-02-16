@@ -17,10 +17,13 @@ limitations under the License.
 package app
 
 import (
+	"context"
 	"net/http"
+	"reflect"
 	"strings"
 
 	apiextensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/admission"
@@ -322,8 +325,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		ControlPlaneSegment:       mcOpts.ControlPlaneSegment,
 		DefaultCluster:            mcOpts.DefaultCluster,
 	})
-	apiExtensions.ExtraConfig.CRDGetter = crdRuntimeMgr.CRDGetterForRequest
-	apiExtensions.ExtraConfig.CRDListerForRequest = crdRuntimeMgr.CRDListerForRequest
+	setCRDRequestResolvers(apiExtensions, crdRuntimeMgr.CRDGetterForRequest, crdRuntimeMgr.CRDListerForRequest)
 	crdController := mcbootstrap.NewMulticlusterCRDController(crdRuntimeMgr, mcOpts.DefaultCluster)
 	crdController.Start(genericConfig.DrainedNotify())
 	prevOnClusterSelected := mcOpts.OnClusterSelected
@@ -432,6 +434,31 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	c.Aggregator = aggregator
 
 	return c, nil
+}
+
+func setCRDRequestResolvers(
+	apiExtensions *apiextensionsapiserver.Config,
+	getter func(ctx context.Context, name string) (*apiextensionsv1.CustomResourceDefinition, error),
+	lister func(ctx context.Context) ([]*apiextensionsv1.CustomResourceDefinition, error),
+) {
+	if apiExtensions == nil {
+		return
+	}
+	v := reflect.ValueOf(&apiExtensions.ExtraConfig).Elem()
+
+	getterField := v.FieldByName("CRDGetter")
+	if getterField.IsValid() && getterField.CanSet() {
+		getterField.Set(reflect.ValueOf(getter))
+	} else {
+		klog.V(2).Info("apiextensions ExtraConfig has no CRDGetter field; skipping request-scoped CRD getter hook")
+	}
+
+	listerField := v.FieldByName("CRDListerForRequest")
+	if listerField.IsValid() && listerField.CanSet() {
+		listerField.Set(reflect.ValueOf(lister))
+	} else {
+		klog.V(2).Info("apiextensions ExtraConfig has no CRDListerForRequest field; skipping request-scoped CRD lister hook")
+	}
 }
 
 func decorateRESTOptionsGetter(server string, getter generic.RESTOptionsGetter, opts mc.Options) generic.RESTOptionsGetter {
