@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
@@ -48,8 +50,8 @@ func (c *ClusterAuthenticator) AuthenticateRequest(req *http.Request) (*authenti
 		}
 	}
 	useRoot := cid == "" || cid == c.rootCluster
-	if useRoot && c.root != nil {
-		return c.root.AuthenticateRequest(req)
+	if useRoot && !isNil(c.root) {
+		return authenticateSafely(c.root, req, "root")
 	}
 	if c.resolver == nil {
 		return nil, false, nil
@@ -58,10 +60,10 @@ func (c *ClusterAuthenticator) AuthenticateRequest(req *http.Request) (*authenti
 	if err != nil {
 		return nil, false, err
 	}
-	if authn == nil {
+	if isNil(authn) {
 		return nil, false, nil
 	}
-	return authn.AuthenticateRequest(req)
+	return authenticateSafely(authn, req, cid)
 }
 
 // ClusterAuthorizer dispatches authorization per cluster.
@@ -93,27 +95,33 @@ func NewClusterAuthorizer(rootCluster string, root authorizer.Authorizer, rootRe
 // Authorize dispatches by cluster context.
 func (c *ClusterAuthorizer) Authorize(ctx context.Context, a authorizer.Attributes) (authorizer.Decision, string, error) {
 	cid := clusterFromContext(ctx)
-	if cid == "" || (cid == c.rootCluster && c.root != nil) || c.resolver == nil {
-		if c.root == nil {
+	if cid == "" || (cid == c.rootCluster && !isNil(c.root)) || c.resolver == nil {
+		if isNil(c.root) {
 			return authorizer.DecisionNoOpinion, "no root authorizer", nil
 		}
-		return c.root.Authorize(ctx, a)
+		if err := validateAttributesForAuthorize(a, "root", authorizerType(c.root)); err != nil {
+			return authorizer.DecisionDeny, "", err
+		}
+		return authorizeSafely(c.root, ctx, a, "root")
 	}
 	authz, _, err := c.resolver.AuthorizerForCluster(cid)
 	if err != nil {
-		return authorizer.DecisionNoOpinion, "", err
+		return authorizer.DecisionDeny, "", err
 	}
-	if authz == nil {
+	if isNil(authz) {
 		return authorizer.DecisionNoOpinion, "no cluster authorizer", nil
 	}
-	return authz.Authorize(ctx, a)
+	if err := validateAttributesForAuthorize(a, cid, authorizerType(authz)); err != nil {
+		return authorizer.DecisionDeny, "", err
+	}
+	return authorizeSafely(authz, ctx, a, cid)
 }
 
 // RulesFor dispatches rule resolution per cluster.
 func (c *ClusterAuthorizer) RulesFor(ctx context.Context, u user.Info, namespace string) ([]authorizer.ResourceRuleInfo, []authorizer.NonResourceRuleInfo, bool, error) {
 	cid := clusterFromContext(ctx)
-	if cid == "" || (cid == c.rootCluster && c.rootResolver != nil) || c.resolver == nil {
-		if c.rootResolver == nil {
+	if cid == "" || (cid == c.rootCluster && !isNil(c.rootResolver)) || c.resolver == nil {
+		if isNil(c.rootResolver) {
 			return nil, nil, false, nil
 		}
 		return c.rootResolver.RulesFor(ctx, u, namespace)
@@ -122,10 +130,86 @@ func (c *ClusterAuthorizer) RulesFor(ctx context.Context, u user.Info, namespace
 	if err != nil {
 		return nil, nil, false, err
 	}
-	if resolver == nil {
+	if isNil(resolver) {
 		return nil, nil, false, nil
 	}
 	return resolver.RulesFor(ctx, u, namespace)
+}
+
+func isNil(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
+func authorizeSafely(authz authorizer.Authorizer, ctx context.Context, a authorizer.Attributes, target string) (decision authorizer.Decision, reason string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			decision = authorizer.DecisionDeny
+			reason = ""
+			err = fmt.Errorf("authorizer panic for cluster %q (type=%s): %v", target, authorizerType(authz), r)
+		}
+	}()
+	return authz.Authorize(ctx, a)
+}
+
+func validateAttributesForAuthorize(a authorizer.Attributes, clusterID, authzType string) error {
+	if isNil(a) {
+		return fmt.Errorf("invalid authorization attributes for cluster %q (authorizer=%s): attributes is nil", clusterID, authzType)
+	}
+	u, err := userFromAttributes(a)
+	if err != nil {
+		return fmt.Errorf("invalid authorization attributes for cluster %q (authorizer=%s): %w", clusterID, authzType, err)
+	}
+	if isNil(u) {
+		return fmt.Errorf("invalid authorization attributes for cluster %q (authorizer=%s): user is nil", clusterID, authzType)
+	}
+	return nil
+}
+
+func userFromAttributes(a authorizer.Attributes) (u user.Info, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			u = nil
+			err = fmt.Errorf("GetUser panic: %v", r)
+		}
+	}()
+	return a.GetUser(), nil
+}
+
+func authorizerType(authz authorizer.Authorizer) string {
+	if isNil(authz) {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%T", authz)
+}
+
+func authenticateSafely(authn authenticator.Request, req *http.Request, target string) (resp *authenticator.Response, ok bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			resp = nil
+			ok = false
+			err = fmt.Errorf("authenticator panic for cluster %q (type=%T): %v", target, authn, r)
+		}
+	}()
+	resp, ok, err = authn.AuthenticateRequest(req)
+	if err != nil || !ok {
+		return resp, ok, err
+	}
+	if resp == nil {
+		return nil, false, fmt.Errorf("invalid authenticator response for cluster %q (type=%T): response is nil", target, authn)
+	}
+	if isNil(resp.User) {
+		return nil, false, fmt.Errorf("invalid authenticator response for cluster %q (type=%T): user is nil", target, authn)
+	}
+	return resp, ok, nil
 }
 
 func clusterFromContext(ctx context.Context) string {

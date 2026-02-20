@@ -162,10 +162,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 						return
 					}
 					if h, err := crdRuntimeMgr.Runtime(cid, genericConfig.DrainedNotify()); err == nil && h != nil {
-						h = genericfilters.WithRequestInfo(h, conf.RequestInfoResolver)
-						h = genericfilters.WithAuditInit(h)
-						h = serverfilters.WithPanicRecovery(h, conf.RequestInfoResolver)
-						h.ServeHTTP(w, r)
+						wrapClusterCRDHandler(h, conf, cid, false).ServeHTTP(w, r)
 						return
 					}
 					klog.Errorf("mc.crdRuntime unresolved at kube cluster=%s path=%s", cid, r.URL.Path)
@@ -361,13 +358,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 			http.Error(w, "cluster CRD runtime unavailable", http.StatusServiceUnavailable)
 			return true
 		}
-		// Ensure RequestInfo is computed from the normalized /apis path
-		// before entering the cluster-scoped CRD runtime handler.
-		h = genericfilters.WithRequestInfo(h, conf.RequestInfoResolver)
-		h = withClusterCRDRequestInfoRewrite(h, clusterID)
-		h = genericfilters.WithAuditInit(h)
-		h = serverfilters.WithPanicRecovery(h, conf.RequestInfoResolver)
-		h.ServeHTTP(w, r)
+		wrapClusterCRDHandler(h, conf, clusterID, false).ServeHTTP(w, r)
 		return true
 	}
 	// Ensure CRDs are also routed through the multicluster handler
@@ -478,6 +469,25 @@ func withClusterCRDRequestInfoRewrite(next http.Handler, clusterID string) http.
 		ctx := apirequest.WithRequestInfo(r.Context(), &rewritten)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func wrapClusterCRDHandler(next http.Handler, conf *server.Config, clusterID string, rewriteRequestInfo bool) http.Handler {
+	if next == nil || conf == nil {
+		return next
+	}
+	h := next
+	if rewriteRequestInfo {
+		h = withClusterCRDRequestInfoRewrite(h, clusterID)
+	}
+	h = genericfilters.WithAuthorization(h, conf.Authorization.Authorizer, conf.Serializer)
+	failedHandler := genericfilters.Unauthorized(conf.Serializer)
+	failedHandler = genericfilters.WithFailedAuthenticationAudit(failedHandler, conf.AuditBackend, conf.AuditPolicyRuleEvaluator)
+	h = genericfilters.WithAuthentication(h, conf.Authentication.Authenticator, failedHandler, conf.Authentication.APIAudiences, conf.Authentication.RequestHeaderConfig)
+	// RequestInfo must be available before rewrite/authn/authz wrappers execute.
+	h = genericfilters.WithRequestInfo(h, conf.RequestInfoResolver)
+	h = genericfilters.WithAuditInit(h)
+	h = serverfilters.WithPanicRecovery(h, conf.RequestInfoResolver)
+	return h
 }
 
 func decorateRESTOptionsGetter(server string, getter generic.RESTOptionsGetter, opts mc.Options) generic.RESTOptionsGetter {

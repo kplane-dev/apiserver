@@ -131,7 +131,23 @@ func (m *CRDRuntimeManager) ServesGroupVersion(clusterID, group, version string,
 		crdServesLookupLat.WithLabelValues(r).Observe(time.Since(start).Seconds())
 		return served, nil
 	}
-	// No fallback direct API lookup: shared projection is the source of truth.
+	// Reconcile from shared projection, then briefly wait for projection updates
+	// to absorb fresh CRD install/update events before returning not served.
+	if served, ok := m.lookupFromSharedProjection(clusterID, group, version); ok {
+		r := result(served)
+		crdServesCacheMiss.WithLabelValues("projection").Inc()
+		crdServesLookupTotal.WithLabelValues(r).Inc()
+		crdServesLookupLat.WithLabelValues(r).Observe(time.Since(start).Seconds())
+		return served, nil
+	}
+	if served, ok := m.waitForSharedProjection(clusterID, group, version, 2*time.Second); ok {
+		r := result(served)
+		crdServesCacheMiss.WithLabelValues("projection-wait").Inc()
+		crdServesLookupTotal.WithLabelValues(r).Inc()
+		crdServesLookupLat.WithLabelValues(r).Observe(time.Since(start).Seconds())
+		return served, nil
+	}
+
 	r := result(false)
 	crdServesLookupTotal.WithLabelValues(r).Inc()
 	crdServesLookupLat.WithLabelValues(r).Observe(time.Since(start).Seconds())
@@ -180,7 +196,7 @@ func (m *CRDRuntimeManager) ensureSharedRuntime(stopCh <-chan struct{}) (runtime
 		go crdServer.GenericAPIServer.RunPostStartHooks(runCtx)
 
 		entry := runtimeEntry{
-			handler: crdServer.GenericAPIServer.Handler.NonGoRestfulMux,
+			handler: crdServer.GenericAPIServer.Handler.Director,
 			server:  crdServer.GenericAPIServer,
 			cancel:  cancel,
 		}
@@ -259,6 +275,52 @@ func (m *CRDRuntimeManager) ensureClusterClient(clusterID string) (apiextensions
 
 func (m *CRDRuntimeManager) lookupFromInformerIndex(clusterID, group, version string) (bool, bool) {
 	return m.servesIndex.Lookup(clusterID, group, version)
+}
+
+func (m *CRDRuntimeManager) lookupFromSharedProjection(clusterID, group, version string) (bool, bool) {
+	crds := m.sharedProjection.List(clusterID)
+	objs := make([]interface{}, 0, len(crds))
+	served := false
+	for _, crd := range crds {
+		if crd == nil {
+			continue
+		}
+		objs = append(objs, crd)
+		if !isCRDEstablished(crd) || crd.Spec.Group != group {
+			continue
+		}
+		for _, v := range crd.Spec.Versions {
+			if v.Served && v.Name == version {
+				served = true
+				break
+			}
+		}
+	}
+	m.rebuildClusterIndex(clusterID, objs)
+	return served, true
+}
+
+func (m *CRDRuntimeManager) waitForSharedProjection(clusterID, group, version string, timeout time.Duration) (bool, bool) {
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if served, ok := m.lookupFromInformerIndex(clusterID, group, version); ok {
+			return served, true
+		}
+		if served, ok := m.lookupFromSharedProjection(clusterID, group, version); ok && served {
+			return true, true
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if served, ok := m.lookupFromInformerIndex(clusterID, group, version); ok {
+		return served, true
+	}
+	if served, ok := m.lookupFromSharedProjection(clusterID, group, version); ok {
+		return served, true
+	}
+	return false, false
 }
 
 func (m *CRDRuntimeManager) ensureSharedCRDState(stopCh <-chan struct{}) error {
