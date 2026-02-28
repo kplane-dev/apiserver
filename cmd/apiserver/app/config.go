@@ -146,7 +146,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	})
 	genericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
-		base := server.DefaultBuildHandlerChain(h, conf)
+		base := withVersionOverride(server.DefaultBuildHandlerChain(h, conf))
 		dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cid, _, _ := mc.FromContext(r.Context())
 			if cid != "" && cid != mcOpts.DefaultCluster && crdRuntimeMgr != nil {
@@ -179,6 +179,8 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		BaseLoopbackClientConfig: genericConfig.LoopbackClientConfig,
 		PathPrefix:               mcOpts.PathPrefix,
 		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
+		EtcdPrefix:               storageFactory.StorageConfig.Prefix,
+		EtcdTransport:            storageFactory.StorageConfig.Transport,
 		Authentication:           opts.Authentication,
 		Authorization:            opts.Authorization,
 		EgressSelector:           genericConfig.EgressSelector,
@@ -190,7 +192,9 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		genericConfig.Authentication.Authenticator = mcauth.NewClusterAuthenticator(mcOpts.DefaultCluster, genericConfig.Authentication.Authenticator, authManager)
 	}
 	if genericConfig.Authorization.Authorizer != nil {
-		clusterAuthorizer := mcauth.NewClusterAuthorizer(mcOpts.DefaultCluster, genericConfig.Authorization.Authorizer, genericConfig.RuleResolver, authManager)
+		// Route root and tenant authorization through the same multicluster
+		// manager-backed path to avoid root-only stale lister divergence.
+		clusterAuthorizer := mcauth.NewClusterAuthorizer(mcOpts.DefaultCluster, nil, nil, authManager)
 		genericConfig.Authorization.Authorizer = clusterAuthorizer
 		genericConfig.RuleResolver = clusterAuthorizer
 	}
@@ -314,6 +318,9 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	if apiExtensions.GenericConfig.RESTOptionsGetter != nil {
 		apiExtensions.GenericConfig.RESTOptionsGetter = decorateRESTOptionsGetter("apiextensions", apiExtensions.GenericConfig.RESTOptionsGetter, mcOpts)
 	}
+	if apiExtensions.ExtraConfig.CRDRESTOptionsGetter != nil {
+		apiExtensions.ExtraConfig.CRDRESTOptionsGetter = decorateRESTOptionsGetter("apiextensions-crd", apiExtensions.ExtraConfig.CRDRESTOptionsGetter, mcOpts)
+	}
 	apiExtensionsClientPool := mc.NewAPIExtensionsClientPool(apiExtensions.GenericConfig.LoopbackClientConfig, mcOpts.PathPrefix, mcOpts.ControlPlaneSegment)
 	apiExtensionsInformerPool := mc.NewAPIExtensionsInformerPoolFromClientPool(apiExtensionsClientPool, 0, genericConfig.DrainedNotify())
 	crdRuntimeMgr = mcbootstrap.NewCRDRuntimeManager(mcbootstrap.CRDRuntimeManagerOptions{
@@ -322,6 +329,8 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		PathPrefix:                mcOpts.PathPrefix,
 		ControlPlaneSegment:       mcOpts.ControlPlaneSegment,
 		DefaultCluster:            mcOpts.DefaultCluster,
+		EtcdPrefix:                storageFactory.StorageConfig.Prefix,
+		EtcdTransport:             storageFactory.StorageConfig.Transport,
 	})
 	setCRDRequestResolvers(apiExtensions, crdRuntimeMgr.CRDGetterForRequest, crdRuntimeMgr.CRDListerForRequest)
 	crdController := mcbootstrap.NewMulticlusterCRDController(crdRuntimeMgr, mcOpts.DefaultCluster)
@@ -364,7 +373,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	// Ensure CRDs are also routed through the multicluster handler
 	apiExtensions.GenericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
-		base := server.DefaultBuildHandlerChain(h, conf)
+		base := withVersionOverride(server.DefaultBuildHandlerChain(h, conf))
 		dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cid, _, _ := mc.FromContext(r.Context())
 			if cid != "" && cid != mcOpts.DefaultCluster {
@@ -381,11 +390,11 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		mut := mca.NewMutating(mcOpts)
 		val := mca.NewValidating(mcOpts)
 		base := apiExtensions.GenericConfig.AdmissionControl
-		chain := []admission.Interface{mut, mcNamespaceLifecycle, mcMutatingWebhook}
+		chain := []admission.Interface{mut, mcNamespaceLifecycle}
 		if base != nil {
 			chain = append(chain, base)
 		}
-		chain = append(chain, mcValidatingWebhook, val)
+		chain = append(chain, val)
 		apiExtensions.GenericConfig.AdmissionControl = admission.NewChainHandler(chain...)
 	}
 	c.ApiExtensions = apiExtensions
@@ -400,7 +409,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	// Ensure aggregator also receives multicluster routing
 	aggregator.GenericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
-		base := server.DefaultBuildHandlerChain(h, conf)
+		base := withVersionOverride(server.DefaultBuildHandlerChain(h, conf))
 		dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cid, _, _ := mc.FromContext(r.Context())
 			if cid != "" && cid != mcOpts.DefaultCluster && crdRuntimeMgr != nil {
@@ -417,11 +426,11 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		mut := mca.NewMutating(mcOpts)
 		val := mca.NewValidating(mcOpts)
 		base := aggregator.GenericConfig.AdmissionControl
-		chain := []admission.Interface{mut, mcNamespaceLifecycle, mcMutatingWebhook}
+		chain := []admission.Interface{mut, mcNamespaceLifecycle}
 		if base != nil {
 			chain = append(chain, base)
 		}
-		chain = append(chain, mcValidatingWebhook, val)
+		chain = append(chain, val)
 		aggregator.GenericConfig.AdmissionControl = admission.NewChainHandler(chain...)
 	}
 	c.Aggregator = aggregator

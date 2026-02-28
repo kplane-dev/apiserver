@@ -3,7 +3,6 @@ package namespace
 import (
 	"sync"
 
-	"github.com/kplane-dev/apiserver/pkg/multicluster/scopedinformer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -32,12 +31,6 @@ type Manager struct {
 
 	mu       sync.Mutex
 	clusters map[string]*clusterEnv
-
-	sharedOnce sync.Once
-	sharedErr  error
-	shared     informers.SharedInformerFactory
-	sharedStop <-chan struct{}
-	sharedOwn  chan struct{}
 }
 
 type clusterEnv struct {
@@ -73,7 +66,7 @@ func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
 	if err != nil {
 		return nil, err
 	}
-	scoped, err := m.scopedNamespaceFactory(clusterID)
+	scoped, err := m.scopedNamespaceFactory(clusterID, cs)
 	if err != nil {
 		return nil, err
 	}
@@ -93,45 +86,15 @@ func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
 	return e, nil
 }
 
-func (m *Manager) scopedNamespaceFactory(clusterID string) (informers.SharedInformerFactory, error) {
-	shared, err := m.ensureSharedFactory()
-	if err != nil {
-		return nil, err
-	}
-	return newScopedFactory(clusterID, mc.DefaultClusterAnnotation, shared), nil
-}
-
-func (m *Manager) ensureSharedFactory() (informers.SharedInformerFactory, error) {
-	m.sharedOnce.Do(func() {
-		if m.opts.BaseLoopbackClientConfig == nil {
-			m.sharedErr = mc.ErrMissingClientFactory
-			return
-		}
-		cs, err := scopedinformer.NewAllClustersKubeClient(m.opts.BaseLoopbackClientConfig)
+func (m *Manager) scopedNamespaceFactory(clusterID string, cs kubernetes.Interface) (informers.SharedInformerFactory, error) {
+	if m.opts.InformerPool != nil {
+		_, factory, _, err := m.opts.InformerPool.Get(clusterID)
 		if err != nil {
-			m.sharedErr = err
-			return
+			return nil, err
 		}
-		factory := informers.NewSharedInformerFactory(cs, 0)
-		if err := factory.Core().V1().Namespaces().Informer().SetTransform(transformNamespaceForShared(mc.DefaultClusterAnnotation)); err != nil {
-			m.sharedErr = err
-			return
-		}
-		if err := scopedinformer.EnsureClusterIndex(factory.Core().V1().Namespaces().Informer(), mc.DefaultClusterAnnotation); err != nil {
-			m.sharedErr = err
-			return
-		}
-		if m.sharedStop == nil {
-			m.sharedOwn = make(chan struct{})
-			m.sharedStop = m.sharedOwn
-		}
-		factory.Start(m.sharedStop)
-		m.shared = factory
-	})
-	if m.sharedErr != nil {
-		return nil, m.sharedErr
+		return factory, nil
 	}
-	return m.shared, nil
+	return informers.NewSharedInformerFactory(cs, 0), nil
 }
 
 // StopCluster is test-oriented cleanup; production can leave informers running.

@@ -41,10 +41,13 @@ func (c *MulticlusterCRDController) Start(stopCh <-chan struct{}) {
 	c.mu.Unlock()
 
 	go c.run()
+	if c.defaultCluster != "" {
+		c.EnsureCluster(c.defaultCluster)
+	}
 }
 
 func (c *MulticlusterCRDController) EnsureCluster(clusterID string) {
-	if c == nil || clusterID == "" || clusterID == c.defaultCluster {
+	if c == nil || clusterID == "" {
 		return
 	}
 

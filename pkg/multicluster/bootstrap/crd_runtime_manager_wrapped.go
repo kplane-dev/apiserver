@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -13,22 +15,29 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
-	apiextensionsinformers "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
+	apiextensionsinformers "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/storage/storagebackend"
 	"k8s.io/apiserver/pkg/util/webhook"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/klog/v2"
+	"go.etcd.io/etcd/client/pkg/v3/transport"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
+	mcstorage "github.com/kplane-dev/apiserver/pkg/multicluster/storage"
 )
 
 var (
@@ -47,6 +56,8 @@ type CRDRuntimeManagerOptions struct {
 	ControlPlaneSegment       string
 	DefaultCluster            string
 	Delegate                  http.Handler
+	EtcdPrefix                string
+	EtcdTransport             storagebackend.TransportConfig
 }
 
 type runtimeEntry struct {
@@ -76,6 +87,7 @@ type CRDRuntimeManager struct {
 	sharedOwnedStop  chan struct{}
 	crdQueue         workqueue.TypedRateLimitingInterface[string]
 	crdWorkersStarted bool
+	crdPlacement     *crdStoragePlacementResolver
 }
 
 func NewCRDRuntimeManager(opts CRDRuntimeManagerOptions) *CRDRuntimeManager {
@@ -87,6 +99,11 @@ func NewCRDRuntimeManager(opts CRDRuntimeManagerOptions) *CRDRuntimeManager {
 		clients:          map[string]apiextensionsclient.Interface{},
 		servesIndex:      NewCRDServesIndex(),
 		sharedProjection: newCRDProjectionStore(),
+		crdPlacement: newCRDStoragePlacementResolver(
+			opts.EtcdPrefix,
+			opts.EtcdTransport,
+			"/apiextensions.k8s.io/customresourcedefinitions/clusters",
+		),
 		crdQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 			workqueue.TypedRateLimitingQueueConfig[string]{Name: "mc_shared_crd_status"},
@@ -94,6 +111,7 @@ func NewCRDRuntimeManager(opts CRDRuntimeManagerOptions) *CRDRuntimeManager {
 	}
 }
 
+// Start initializes the shared CRD informer/workers used for status and delete reconciliation.
 func (m *CRDRuntimeManager) Runtime(clusterID string, stopCh <-chan struct{}) (http.Handler, error) {
 	if m == nil || clusterID == "" || clusterID == m.opts.DefaultCluster || m.opts.BaseAPIExtensionsConfig == nil {
 		return nil, nil
@@ -147,7 +165,6 @@ func (m *CRDRuntimeManager) ServesGroupVersion(clusterID, group, version string,
 		crdServesLookupLat.WithLabelValues(r).Observe(time.Since(start).Seconds())
 		return served, nil
 	}
-
 	r := result(false)
 	crdServesLookupTotal.WithLabelValues(r).Inc()
 	crdServesLookupLat.WithLabelValues(r).Observe(time.Since(start).Seconds())
@@ -348,9 +365,9 @@ func (m *CRDRuntimeManager) ensureSharedCRDState(stopCh <-chan struct{}) error {
 			return nil, err
 		}
 
-		factory := apiextensionsinformers.NewSharedInformerFactory(cs, 0)
+		factory := apiextensionsinformers.NewSharedInformerFactory(cs, 5*time.Second)
 		crdInformer := factory.Apiextensions().V1().CustomResourceDefinitions().Informer()
-		if err := crdInformer.SetTransform(transformCRDForShared(mc.DefaultClusterAnnotation)); err != nil {
+		if err := crdInformer.SetTransform(transformCRDForShared(m.opts.DefaultCluster, m.clusterForCRDFromStorage)); err != nil {
 			return nil, err
 		}
 		_, err = crdInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -374,7 +391,6 @@ func (m *CRDRuntimeManager) ensureSharedCRDState(stopCh <-chan struct{}) error {
 			return nil, fmt.Errorf("failed waiting for shared CRD informer sync")
 		}
 		m.startSharedCRDWorkers(startStop)
-
 		m.rebuildSharedProjection(crdInformer.GetStore().List())
 
 		m.mu.Lock()
@@ -398,7 +414,13 @@ func (m *CRDRuntimeManager) rebuildSharedProjection(objs []interface{}) {
 		if !ok {
 			continue
 		}
-		clusterID := objectClusterID(crd, mc.DefaultClusterAnnotation)
+		clusterID := objectClusterID(crd)
+		if clusterID == "" {
+			clusterID = m.clusterForCRDFromStorage(crd)
+		}
+		if clusterID == "" {
+			clusterID = m.opts.DefaultCluster
+		}
 		if clusterID == "" {
 			continue
 		}
@@ -406,7 +428,7 @@ func (m *CRDRuntimeManager) rebuildSharedProjection(objs []interface{}) {
 		decodedObjs = append(decodedObjs, decoded)
 		byCluster[clusterID] = append(byCluster[clusterID], decoded)
 	}
-	m.sharedProjection.ReplaceAll(decodedObjs, mc.DefaultClusterAnnotation)
+	m.sharedProjection.ReplaceAll(decodedObjs)
 	for clusterID, clusterObjs := range byCluster {
 		m.servesIndex.RebuildCluster(clusterID, clusterObjs)
 	}
@@ -417,7 +439,13 @@ func (m *CRDRuntimeManager) onSharedCRDUpsert(obj interface{}) {
 	if !ok {
 		return
 	}
-	clusterID := objectClusterID(crd, mc.DefaultClusterAnnotation)
+	clusterID := objectClusterID(crd)
+	if clusterID == "" {
+		clusterID = m.clusterForCRDFromStorage(crd)
+	}
+	if clusterID == "" {
+		clusterID = m.opts.DefaultCluster
+	}
 	if clusterID == "" {
 		return
 	}
@@ -432,7 +460,13 @@ func (m *CRDRuntimeManager) onSharedCRDDelete(obj interface{}) {
 	if !ok {
 		return
 	}
-	clusterID := objectClusterID(crd, mc.DefaultClusterAnnotation)
+	clusterID := objectClusterID(crd)
+	if clusterID == "" {
+		clusterID = m.clusterForCRDFromStorage(crd)
+	}
+	if clusterID == "" {
+		clusterID = m.opts.DefaultCluster
+	}
 	if clusterID == "" {
 		return
 	}
@@ -442,11 +476,13 @@ func (m *CRDRuntimeManager) onSharedCRDDelete(obj interface{}) {
 }
 
 func (m *CRDRuntimeManager) EnsureCluster(clusterID string, stopCh <-chan struct{}) error {
-	if m == nil || clusterID == "" || clusterID == m.opts.DefaultCluster {
+	if m == nil || clusterID == "" {
 		return nil
 	}
-	if _, err := m.ensureSharedRuntime(stopCh); err != nil {
-		return err
+	if clusterID != m.opts.DefaultCluster {
+		if _, err := m.ensureSharedRuntime(stopCh); err != nil {
+			return err
+		}
 	}
 	if err := m.ensureSharedCRDState(stopCh); err != nil {
 		return err
@@ -608,7 +644,7 @@ func (s *crdProjectionStore) List(clusterID string) []*apiextensionsv1.CustomRes
 	return out
 }
 
-func (s *crdProjectionStore) ReplaceAll(objs []interface{}, clusterLabelKey string) {
+func (s *crdProjectionStore) ReplaceAll(objs []interface{}) {
 	if s == nil {
 		return
 	}
@@ -618,7 +654,7 @@ func (s *crdProjectionStore) ReplaceAll(objs []interface{}, clusterLabelKey stri
 		if !ok {
 			continue
 		}
-		clusterID := objectClusterID(crd, clusterLabelKey)
+		clusterID := objectClusterID(crd)
 		if clusterID == "" {
 			continue
 		}
@@ -680,26 +716,62 @@ func (m *CRDRuntimeManager) sharedStartStopCh(stopCh <-chan struct{}) <-chan str
 	return m.sharedStopCh
 }
 
-func objectClusterID(obj interface{}, clusterLabelKey string) string {
-	if clusterLabelKey == "" {
-		clusterLabelKey = mc.DefaultClusterAnnotation
+func objectClusterID(obj interface{}) string {
+	if entry, ok := obj.(*mcstorage.InternalEntry); ok && entry != nil {
+		if entry.ClusterID != "" {
+			return entry.ClusterID
+		}
+		if entry.StorageKey != "" {
+			i := strings.Index(entry.StorageKey, "/clusters/")
+			if i > 0 {
+				root := strings.TrimSuffix(entry.StorageKey[:i+len("/clusters")], "/")
+				resolver := mcstorage.KeyLayoutPlacementResolver{KindRootPrefix: root}
+				if cid, ok := resolver.ClusterFromStorageKey(entry.StorageKey); ok {
+					return cid
+				}
+			}
+		}
+		if entry.Object != nil {
+			obj = entry.Object
+		}
 	}
-	accessor, err := meta.Accessor(obj)
-	if err != nil {
+	crd, ok := obj.(*apiextensionsv1.CustomResourceDefinition)
+	if !ok || crd == nil {
 		return ""
 	}
-	return accessor.GetLabels()[clusterLabelKey]
+	if crd.Name == "" {
+		return ""
+	}
+	if !strings.HasPrefix(crd.Name, sharedCRDNamePrefix) {
+		return ""
+	}
+	rest := strings.TrimPrefix(crd.Name, sharedCRDNamePrefix)
+	idx := strings.Index(rest, "__")
+	if idx <= 0 {
+		return ""
+	}
+	return rest[:idx]
 }
 
 const sharedCRDNamePrefix = "__mc_shared_crd__"
 
-func transformCRDForShared(clusterLabelKey string) cache.TransformFunc {
+func (m *CRDRuntimeManager) clusterForCRDFromStorage(crd *apiextensionsv1.CustomResourceDefinition) string {
+	if m == nil || m.crdPlacement == nil {
+		return ""
+	}
+	return m.crdPlacement.ClusterForCRD(crd)
+}
+
+func transformCRDForShared(_ string, resolver func(*apiextensionsv1.CustomResourceDefinition) string) cache.TransformFunc {
 	return func(obj interface{}) (interface{}, error) {
 		crd, ok := obj.(*apiextensionsv1.CustomResourceDefinition)
 		if !ok || crd == nil {
 			return obj, nil
 		}
-		clusterID := objectClusterID(crd, clusterLabelKey)
+		clusterID := objectClusterID(crd)
+		if clusterID == "" && resolver != nil {
+			clusterID = resolver(crd)
+		}
 		if clusterID == "" {
 			return obj, nil
 		}
@@ -707,6 +779,139 @@ func transformCRDForShared(clusterLabelKey string) cache.TransformFunc {
 		cp.Name = encodeSharedCRDName(clusterID, cp.Name)
 		return cp, nil
 	}
+}
+
+type crdStoragePlacementResolver struct {
+	etcdPrefix     string
+	transport      storagebackend.TransportConfig
+	kindRootPrefix string
+	resolver       mcstorage.PlacementResolver
+
+	mu     sync.Mutex
+	client *clientv3.Client
+}
+
+func newCRDStoragePlacementResolver(etcdPrefix string, transportCfg storagebackend.TransportConfig, kindRootPrefix string) *crdStoragePlacementResolver {
+	trimmedRoot := strings.TrimSuffix(kindRootPrefix, "/")
+	if strings.TrimSpace(etcdPrefix) == "" {
+		etcdPrefix = "/registry"
+	}
+	return &crdStoragePlacementResolver{
+		etcdPrefix:     strings.TrimSuffix(etcdPrefix, "/"),
+		transport:      transportCfg,
+		kindRootPrefix: trimmedRoot,
+		resolver:       mcstorage.KeyLayoutPlacementResolver{KindRootPrefix: trimmedRoot},
+	}
+}
+
+func (r *crdStoragePlacementResolver) ClusterForCRD(crd *apiextensionsv1.CustomResourceDefinition) string {
+	if r == nil || crd == nil || crd.Name == "" {
+		return ""
+	}
+	if crd.GetResourceVersion() == "" {
+		return ""
+	}
+	cli, err := r.getClient()
+	if err != nil {
+		return ""
+	}
+	wantRV := int64(0)
+	if rv := crd.GetResourceVersion(); rv != "" {
+		if parsed, err := strconv.ParseInt(rv, 10, 64); err == nil {
+			wantRV = parsed
+		}
+	}
+	if wantRV == 0 {
+		return ""
+	}
+	queryPrefix := strings.TrimSuffix(r.fullETCDPrefixForRoot(), "/") + "/"
+	wantSuffix := "/" + crd.Name
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		resp, err := cli.Get(
+			ctx,
+			queryPrefix,
+			clientv3.WithPrefix(),
+			clientv3.WithKeysOnly(),
+			clientv3.WithMinModRev(wantRV),
+			clientv3.WithMaxModRev(wantRV),
+		)
+		cancel()
+		if err == nil {
+			for _, kv := range resp.Kvs {
+				storageKey := r.storageKeyFromETCDKey(string(kv.Key))
+				if storageKey == "" || !strings.HasSuffix(storageKey, wantSuffix) {
+					continue
+				}
+				cid, ok := r.resolver.ClusterFromStorageKey(storageKey)
+				if ok && cid != "" && kv.ModRevision == wantRV {
+					return cid
+				}
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return ""
+}
+
+func (r *crdStoragePlacementResolver) fullETCDPrefixForRoot() string {
+	return strings.TrimSuffix(r.etcdPrefix, "/") + "/" + strings.TrimPrefix(r.kindRootPrefix, "/")
+}
+
+func (r *crdStoragePlacementResolver) storageKeyFromETCDKey(etcdKey string) string {
+	prefix := strings.TrimSuffix(r.etcdPrefix, "/")
+	trimmed := strings.TrimPrefix(etcdKey, prefix)
+	if trimmed == etcdKey {
+		return ""
+	}
+	if !strings.HasPrefix(trimmed, "/") {
+		trimmed = "/" + trimmed
+	}
+	return trimmed
+}
+
+func (r *crdStoragePlacementResolver) getClient() (*clientv3.Client, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.client != nil {
+		return r.client, nil
+	}
+	if len(r.transport.ServerList) == 0 {
+		if env := strings.TrimSpace(os.Getenv("ETCD_ENDPOINTS")); env != "" {
+			for _, ep := range strings.Split(env, ",") {
+				ep = strings.TrimSpace(ep)
+				if ep != "" {
+					r.transport.ServerList = append(r.transport.ServerList, ep)
+				}
+			}
+		}
+	}
+	if len(r.transport.ServerList) == 0 {
+		return nil, fmt.Errorf("no etcd servers configured")
+	}
+	cfg := clientv3.Config{
+		Endpoints:   append([]string{}, r.transport.ServerList...),
+		DialTimeout: 5 * time.Second,
+	}
+	if r.transport.CertFile != "" || r.transport.KeyFile != "" || r.transport.TrustedCAFile != "" {
+		tlsInfo := transport.TLSInfo{
+			CertFile:      r.transport.CertFile,
+			KeyFile:       r.transport.KeyFile,
+			TrustedCAFile: r.transport.TrustedCAFile,
+		}
+		tlsCfg, err := tlsInfo.ClientConfig()
+		if err != nil {
+			return nil, err
+		}
+		cfg.TLS = tlsCfg
+	}
+	cli, err := clientv3.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	r.client = cli
+	return r.client, nil
 }
 
 func encodeSharedCRDName(clusterID, name string) string {
@@ -799,11 +1004,30 @@ func (m *CRDRuntimeManager) reconcileCRDStatusKey(key string) error {
 	if !ok {
 		return nil
 	}
-	crd, found := m.sharedProjection.Get(clusterID, name)
-	if !found || crd == nil {
+	_, found := m.sharedProjection.Get(clusterID, name)
+	if !found {
 		return nil
 	}
-	desired := crd.DeepCopy()
+	cs, err := m.ensureClusterClient(clusterID)
+	if err != nil {
+		return err
+	}
+	live, err := cs.ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if live.DeletionTimestamp != nil && hasCRDCleanupFinalizer(live) {
+		return m.reconcileDeletingCRD(clusterID, live)
+	}
+	// Let upstream finalizer/status controllers own terminating CRDs.
+	// Overwriting status during deletion can stall customresourcecleanup.
+	if live.DeletionTimestamp != nil {
+		return nil
+	}
+	desired := live.DeepCopy()
 	desired.Status.AcceptedNames = desired.Spec.Names
 
 	namesAccepted := apiextensionsv1.CustomResourceDefinitionCondition{
@@ -830,13 +1054,8 @@ func (m *CRDRuntimeManager) reconcileCRDStatusKey(key string) error {
 	}
 	apiextensionshelpers.SetCRDCondition(desired, established)
 
-	if equality.Semantic.DeepEqual(crd.Status, desired.Status) {
+	if equality.Semantic.DeepEqual(live.Status, desired.Status) {
 		return nil
-	}
-
-	cs, err := m.ensureClusterClient(clusterID)
-	if err != nil {
-		return err
 	}
 	_, err = cs.ApiextensionsV1().CustomResourceDefinitions().UpdateStatus(context.TODO(), desired, metav1.UpdateOptions{})
 	if apierrors.IsNotFound(err) {
@@ -847,3 +1066,160 @@ func (m *CRDRuntimeManager) reconcileCRDStatusKey(key string) error {
 	}
 	return err
 }
+
+func hasCRDCleanupFinalizer(crd *apiextensionsv1.CustomResourceDefinition) bool {
+	for _, f := range crd.Finalizers {
+		if f == apiextensionsv1.CustomResourceCleanupFinalizer {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *CRDRuntimeManager) reconcileDeletingCRD(clusterID string, crd *apiextensionsv1.CustomResourceDefinition) error {
+	cs, err := m.ensureClusterClient(clusterID)
+	if err != nil {
+		return err
+	}
+
+	live, err := cs.ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), crd.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if live.DeletionTimestamp == nil || !hasCRDCleanupFinalizer(live) {
+		return nil
+	}
+
+	inProgress := live.DeepCopy()
+	apiextensionshelpers.SetCRDCondition(inProgress, apiextensionsv1.CustomResourceDefinitionCondition{
+		Type:    apiextensionsv1.Terminating,
+		Status:  apiextensionsv1.ConditionTrue,
+		Reason:  "InstanceDeletionInProgress",
+		Message: "CustomResource deletion is in progress",
+	})
+	if _, err := cs.ApiextensionsV1().CustomResourceDefinitions().UpdateStatus(context.TODO(), inProgress, metav1.UpdateOptions{}); err != nil {
+		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+			return nil
+		}
+		return err
+	}
+
+	cond, delErr := m.deleteCRInstances(clusterID, live)
+
+	live, err = cs.ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), crd.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	next := live.DeepCopy()
+	apiextensionshelpers.SetCRDCondition(next, cond)
+	if delErr != nil {
+		if _, err := cs.ApiextensionsV1().CustomResourceDefinitions().UpdateStatus(context.TODO(), next, metav1.UpdateOptions{}); err != nil && !apierrors.IsConflict(err) && !apierrors.IsNotFound(err) {
+			klog.Errorf("mc.crd status update failed while deleting instances cluster=%s crd=%s err=%v", clusterID, crd.Name, err)
+		}
+		return delErr
+	}
+
+	apiextensionshelpers.CRDRemoveFinalizer(next, apiextensionsv1.CustomResourceCleanupFinalizer)
+	if _, err := cs.ApiextensionsV1().CustomResourceDefinitions().UpdateStatus(context.TODO(), next, metav1.UpdateOptions{}); err != nil {
+		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func (m *CRDRuntimeManager) deleteCRInstances(clusterID string, crd *apiextensionsv1.CustomResourceDefinition) (apiextensionsv1.CustomResourceDefinitionCondition, error) {
+	dc, err := m.dynamicClientForCluster(clusterID)
+	if err != nil {
+		return deletingCond("InstanceDeletionFailed", fmt.Sprintf("could not create dynamic client: %v", err)), err
+	}
+
+	storageVersion, err := apiextensionshelpers.GetCRDStorageVersion(crd)
+	if err != nil {
+		return deletingCond("InstanceDeletionFailed", fmt.Sprintf("could not resolve storage version: %v", err)), err
+	}
+	resource := crd.Status.AcceptedNames.Plural
+	if resource == "" {
+		resource = crd.Spec.Names.Plural
+	}
+	gvr := schema.GroupVersionResource{
+		Group:    crd.Spec.Group,
+		Version:  storageVersion,
+		Resource: resource,
+	}
+	rc := dc.Resource(gvr)
+
+	ctx := context.TODO()
+	list, err := rc.List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return deletingCond("InstanceDeletionFailed", fmt.Sprintf("could not list instances: %v", err)), err
+	}
+
+	if crd.Spec.Scope == apiextensionsv1.NamespaceScoped {
+		seen := sets.New[string]()
+		for _, item := range list.Items {
+			ns := item.GetNamespace()
+			if ns == "" || seen.Has(ns) {
+				continue
+			}
+			seen.Insert(ns)
+			if err := rc.Namespace(ns).DeleteCollection(ctx, metav1.DeleteOptions{}, metav1.ListOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				return deletingCond("InstanceDeletionFailed", fmt.Sprintf("could not issue all deletes: %v", err)), err
+			}
+		}
+	} else {
+		if err := rc.DeleteCollection(ctx, metav1.DeleteOptions{}, metav1.ListOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return deletingCond("InstanceDeletionFailed", fmt.Sprintf("could not issue all deletes: %v", err)), err
+		}
+	}
+
+	err = wait.PollUntilContextTimeout(ctx, 5*time.Second, 1*time.Minute, true, func(ctx context.Context) (bool, error) {
+		l, err := rc.List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return false, err
+		}
+		return len(l.Items) == 0, nil
+	})
+	if err != nil {
+		return deletingCond("InstanceDeletionCheck", fmt.Sprintf("could not confirm zero CustomResources remaining: %v", err)), err
+	}
+	return deletingCond("InstanceDeletionCompleted", "removed all instances"), nil
+}
+
+func deletingCond(reason, message string) apiextensionsv1.CustomResourceDefinitionCondition {
+	status := apiextensionsv1.ConditionTrue
+	if reason == "InstanceDeletionCompleted" {
+		status = apiextensionsv1.ConditionFalse
+	}
+	return apiextensionsv1.CustomResourceDefinitionCondition{
+		Type:    apiextensionsv1.Terminating,
+		Status:  status,
+		Reason:  reason,
+		Message: message,
+	}
+}
+
+func (m *CRDRuntimeManager) dynamicClientForCluster(clusterID string) (dynamic.Interface, error) {
+	base := m.baseLoopbackConfig()
+	if base == nil {
+		return nil, fmt.Errorf("base apiextensions loopback config is required")
+	}
+	cfg := rest.CopyConfig(base)
+	host, err := mc.ClusterHost(cfg.Host, mc.Options{
+		PathPrefix:          m.opts.PathPrefix,
+		ControlPlaneSegment: m.opts.ControlPlaneSegment,
+	}, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Host = host
+	return dynamic.NewForConfig(cfg)
+}
+

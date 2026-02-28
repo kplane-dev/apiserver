@@ -147,29 +147,14 @@ keyFunc := func(obj runtime.Object) (string, error) {
 }
 ```
 
-#### Admission: server-owned cluster label
-We stamp a server-owned cluster label on persisted objects and validate it on
-create/update to prevent cross-cluster writes and support watchcache keying.
+#### Admission: internal cluster identity
+We store cluster identity in managed fields and validate it on create/update
+to prevent cross-cluster writes and support watchcache keying.
 
 ```go
-lbls := accessor.GetLabels()
-if lbls == nil {
-	lbls = map[string]string{}
-}
-key := m.Options.ClusterAnnotationKey
-if key == "" {
-	key = mcv1.DefaultClusterAnnotation
-}
-lbls[key] = cid
-accessor.SetLabels(lbls)
-```
-Note: the `ClusterAnnotationKey` fallback to `DefaultClusterAnnotation` is
-temporary and not ideal. It exists to preserve compatibility while we migrate
-callers to an explicit label key; avoid relying on this fallback long term.
-
-```go
-if cid := acc.GetLabels()[key]; cid != reqCID {
-	return fmt.Errorf("cluster label %q=%q must match request cluster %q", key, cid, reqCID)
+mc.SetObjectClusterIdentity(obj, reqCID)
+if cid := mc.ObjectClusterIdentity(obj); cid != reqCID {
+	return fmt.Errorf("cluster identity %q must match request cluster %q", cid, reqCID)
 }
 ```
 

@@ -114,6 +114,7 @@ func mustWriteTokenFile(t *testing.T, path string) string {
 type apiserverOptions struct {
 	rootCluster string
 	etcdPrefix  string
+	port        int
 	extraArgs   []string
 }
 
@@ -128,7 +129,10 @@ func startAPIServerWithOptions(t *testing.T, etcdEndpoints string, opts apiserve
 	}
 
 	bin := buildAPIServerBinary(t)
-	port := mustFreePort(t)
+	port := opts.port
+	if port == 0 {
+		port = mustFreePort(t)
+	}
 	tmp := t.TempDir()
 
 	ctx, cancel := context.WithCancel(context.Background())

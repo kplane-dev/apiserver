@@ -1,7 +1,6 @@
 package webhook
 
 import (
-	"fmt"
 	"reflect"
 	"sync"
 
@@ -9,10 +8,8 @@ import (
 	clientgoinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
 
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
-	"github.com/kplane-dev/apiserver/pkg/multicluster/scopedinformer"
 )
 
 type Options struct {
@@ -49,13 +46,6 @@ type Manager struct {
 
 	mu       sync.Mutex
 	clusters map[string]*clusterEnv
-
-	sharedOnce sync.Once
-	sharedErr  error
-	shared     clientgoinformers.SharedInformerFactory
-	sharedStop <-chan struct{}
-	sharedOwn  chan struct{}
-	sharedSync chan struct{}
 }
 
 type clusterEnv struct {
@@ -96,11 +86,12 @@ func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
 	if err != nil {
 		return nil, err
 	}
-	scoped, err := m.scopedWebhookFactory(clusterID)
+	scoped, err := m.scopedWebhookFactory(clusterID, cs)
 	if err != nil {
 		return nil, err
 	}
 	stopCh := make(chan struct{})
+	synced := make(chan struct{})
 
 	sr := newDirectServiceResolver(
 		scoped.Core().V1().Services().Lister(),
@@ -113,7 +104,7 @@ func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
 		cid:             clusterID,
 		stopCh:          stopCh,
 		ownCh:           stopCh,
-		synced:          m.sharedSync,
+		synced:          synced,
 		clientset:       cs,
 		informers:       scoped,
 		serviceResolver: sr,
@@ -126,63 +117,26 @@ func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
 	_ = scoped.Admissionregistration().V1().MutatingWebhookConfigurations().Informer()
 	_ = scoped.Admissionregistration().V1().ValidatingWebhookConfigurations().Informer()
 	scoped.Start(stopCh)
+	go func() {
+		ok := scoped.WaitForCacheSync(stopCh)
+		if allSynced(ok) {
+			close(synced)
+		}
+	}()
 
 	m.clusters[clusterID] = e
 	return e, nil
 }
 
-func (m *Manager) scopedWebhookFactory(clusterID string) (clientgoinformers.SharedInformerFactory, error) {
-	shared, err := m.ensureSharedFactory()
-	if err != nil {
-		return nil, err
-	}
-	return newScopedFactory(clusterID, mc.DefaultClusterAnnotation, shared), nil
-}
-
-func (m *Manager) ensureSharedFactory() (clientgoinformers.SharedInformerFactory, error) {
-	m.sharedOnce.Do(func() {
-		if m.opts.BaseLoopbackClientConfig == nil {
-			m.sharedErr = fmt.Errorf("base loopback config is required for shared webhook factory")
-			return
-		}
-		cs, err := scopedinformer.NewAllClustersKubeClient(m.opts.BaseLoopbackClientConfig)
+func (m *Manager) scopedWebhookFactory(clusterID string, cs kubernetes.Interface) (clientgoinformers.SharedInformerFactory, error) {
+	if m.opts.InformerPool != nil {
+		_, factory, _, err := m.opts.InformerPool.Get(clusterID)
 		if err != nil {
-			m.sharedErr = err
-			return
+			return nil, err
 		}
-		factory := clientgoinformers.NewSharedInformerFactory(cs, 0)
-		webhookInformers := []cache.SharedIndexInformer{
-			factory.Core().V1().Namespaces().Informer(),
-			factory.Core().V1().Services().Informer(),
-			factory.Discovery().V1().EndpointSlices().Informer(),
-			factory.Admissionregistration().V1().MutatingWebhookConfigurations().Informer(),
-			factory.Admissionregistration().V1().ValidatingWebhookConfigurations().Informer(),
-		}
-		for _, inf := range webhookInformers {
-			if err := scopedinformer.EnsureClusterIndex(inf, mc.DefaultClusterAnnotation); err != nil {
-				m.sharedErr = err
-				return
-			}
-		}
-		if m.sharedStop == nil {
-			m.sharedOwn = make(chan struct{})
-			m.sharedStop = m.sharedOwn
-		}
-		factory.Start(m.sharedStop)
-		// One shared cache-sync signal for all clusters; scoped informers are projections over shared caches.
-		m.sharedSync = make(chan struct{})
-		go func() {
-			ok := factory.WaitForCacheSync(m.sharedStop)
-			if allSynced(ok) {
-				close(m.sharedSync)
-			}
-		}()
-		m.shared = factory
-	})
-	if m.sharedErr != nil {
-		return nil, m.sharedErr
+		return factory, nil
 	}
-	return m.shared, nil
+	return clientgoinformers.NewSharedInformerFactory(cs, 0), nil
 }
 
 func allSynced(m map[reflect.Type]bool) bool {

@@ -43,24 +43,18 @@ import (
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 	"k8s.io/client-go/tools/cache"
 
-	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
 	"github.com/kplane-dev/apiserver/pkg/multicluster/scopedinformer"
 )
 
 type scopedFactory struct {
-	clusterID       string
-	clusterLabelKey string
-	shared          informers.SharedInformerFactory
+	clusterID string
+	shared    informers.SharedInformerFactory
 }
 
-func newScopedFactory(clusterID, clusterLabelKey string, shared informers.SharedInformerFactory) informers.SharedInformerFactory {
-	if clusterLabelKey == "" {
-		clusterLabelKey = mc.DefaultClusterAnnotation
-	}
+func newScopedFactory(clusterID string, shared informers.SharedInformerFactory) informers.SharedInformerFactory {
 	return &scopedFactory{
-		clusterID:       clusterID,
-		clusterLabelKey: clusterLabelKey,
-		shared:          shared,
+		clusterID: clusterID,
+		shared:    shared,
 	}
 }
 
@@ -155,7 +149,7 @@ func (v *scopedCoreV1) LimitRanges() coreinformersv1.LimitRangeInformer {
 func (v *scopedCoreV1) Namespaces() coreinformersv1.NamespaceInformer {
 	base := v.f.shared.Core().V1().Namespaces().Informer()
 	return &scopedNamespaceInformer{
-		informer: newFilteredSharedIndexInformer(base, v.f.clusterID, v.f.clusterLabelKey),
+		informer: newFilteredSharedIndexInformer(base, v.f.clusterID),
 		lister:   &scopedNamespaceLister{indexer: base.GetIndexer(), clusterID: v.f.clusterID},
 	}
 }
@@ -182,7 +176,7 @@ func (v *scopedCoreV1) Secrets() coreinformersv1.SecretInformer {
 func (v *scopedCoreV1) Services() coreinformersv1.ServiceInformer {
 	base := v.f.shared.Core().V1().Services().Informer()
 	return &scopedServiceInformer{
-		informer: newFilteredSharedIndexInformer(base, v.f.clusterID, v.f.clusterLabelKey),
+		informer: newFilteredSharedIndexInformer(base, v.f.clusterID),
 		lister:   &scopedServiceLister{indexer: base.GetIndexer(), clusterID: v.f.clusterID},
 	}
 }
@@ -204,7 +198,7 @@ type scopedDiscoveryV1 struct{ f *scopedFactory }
 func (v *scopedDiscoveryV1) EndpointSlices() discoveryinformersv1.EndpointSliceInformer {
 	base := v.f.shared.Discovery().V1().EndpointSlices().Informer()
 	return &scopedEndpointSliceInformer{
-		informer: newFilteredSharedIndexInformer(base, v.f.clusterID, v.f.clusterLabelKey),
+		informer: newFilteredSharedIndexInformer(base, v.f.clusterID),
 		lister:   &scopedEndpointSliceLister{indexer: base.GetIndexer(), clusterID: v.f.clusterID},
 	}
 }
@@ -226,14 +220,14 @@ type scopedAdmissionregistrationV1 struct{ f *scopedFactory }
 func (v *scopedAdmissionregistrationV1) MutatingWebhookConfigurations() admissionregistrationinformersv1.MutatingWebhookConfigurationInformer {
 	base := v.f.shared.Admissionregistration().V1().MutatingWebhookConfigurations().Informer()
 	return &scopedMutatingWebhookConfigurationInformer{
-		informer: newFilteredSharedIndexInformer(base, v.f.clusterID, v.f.clusterLabelKey),
+		informer: newFilteredSharedIndexInformer(base, v.f.clusterID),
 		lister:   &scopedMutatingWebhookConfigurationLister{indexer: base.GetIndexer(), clusterID: v.f.clusterID},
 	}
 }
 func (v *scopedAdmissionregistrationV1) ValidatingWebhookConfigurations() admissionregistrationinformersv1.ValidatingWebhookConfigurationInformer {
 	base := v.f.shared.Admissionregistration().V1().ValidatingWebhookConfigurations().Informer()
 	return &scopedValidatingWebhookConfigurationInformer{
-		informer: newFilteredSharedIndexInformer(base, v.f.clusterID, v.f.clusterLabelKey),
+		informer: newFilteredSharedIndexInformer(base, v.f.clusterID),
 		lister:   &scopedValidatingWebhookConfigurationLister{indexer: base.GetIndexer(), clusterID: v.f.clusterID},
 	}
 }
@@ -244,12 +238,8 @@ func (v *scopedAdmissionregistrationV1) ValidatingAdmissionPolicyBindings() admi
 	return v.f.shared.Admissionregistration().V1().ValidatingAdmissionPolicyBindings()
 }
 
-func newFilteredSharedIndexInformer(shared cache.SharedIndexInformer, clusterID, clusterLabelKey string) cache.SharedIndexInformer {
-	return scopedinformer.NewFilteredSharedIndexInformer(shared, clusterID, clusterLabelKey)
-}
-
-func objectCluster(obj interface{}, clusterLabelKey string) string {
-	return scopedinformer.ObjectCluster(obj, clusterLabelKey)
+func newFilteredSharedIndexInformer(shared cache.SharedIndexInformer, clusterID string) cache.SharedIndexInformer {
+	return scopedinformer.NewFilteredSharedIndexInformer(shared, clusterID)
 }
 
 func filteredByCluster(indexer cache.Indexer, clusterID string) []interface{} {

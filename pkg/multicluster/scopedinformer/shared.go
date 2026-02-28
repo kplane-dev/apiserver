@@ -3,14 +3,16 @@ package scopedinformer
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
-	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
+	mcstorage "github.com/kplane-dev/apiserver/pkg/multicluster/storage"
 )
 
 const ClusterIndexName = "mc.cluster"
@@ -34,10 +36,10 @@ func NewAllClustersKubeClient(base *rest.Config) (kubernetes.Interface, error) {
 	return kubernetes.NewForConfig(cfg)
 }
 
-func EnsureClusterIndex(inf cache.SharedIndexInformer, clusterLabelKey string) error {
+func EnsureClusterIndex(inf cache.SharedIndexInformer) error {
 	return inf.AddIndexers(cache.Indexers{
 		ClusterIndexName: func(obj interface{}) ([]string, error) {
-			cid := ObjectCluster(obj, clusterLabelKey)
+			cid := ObjectCluster(obj)
 			if cid == "" {
 				return nil, nil
 			}
@@ -46,15 +48,66 @@ func EnsureClusterIndex(inf cache.SharedIndexInformer, clusterLabelKey string) e
 	})
 }
 
-func ObjectCluster(obj interface{}, clusterLabelKey string) string {
+// ClusterEntryTransform wraps informer objects into InternalEntry so cluster
+// metadata can be carried outside model fields.
+func ClusterEntryTransform() cache.TransformFunc {
+	return func(obj interface{}) (interface{}, error) {
+		if entry, ok := obj.(*mcstorage.InternalEntry); ok && entry != nil {
+			return entry, nil
+		}
+		ro, ok := obj.(runtime.Object)
+		if !ok || ro == nil {
+			return obj, nil
+		}
+		return &mcstorage.InternalEntry{
+			Object: ro,
+		}, nil
+	}
+}
+
+func ObjectCluster(obj interface{}) string {
 	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		obj = tombstone.Obj
 	}
-	acc, err := meta.Accessor(obj)
-	if err != nil {
+	if entry, ok := obj.(*mcstorage.InternalEntry); ok && entry != nil {
+		if entry.ClusterID != "" {
+			return entry.ClusterID
+		}
+		if entry.StorageKey != "" {
+			if cid := clusterFromStorageKey(entry.StorageKey); cid != "" {
+				return cid
+			}
+		}
 		return ""
 	}
-	return acc.GetLabels()[clusterLabelKey]
+	return ""
+}
+
+func clusterFromStorageKey(storageKey string) string {
+	i := strings.Index(storageKey, "/clusters/")
+	if i <= 0 {
+		return ""
+	}
+	root := strings.TrimSuffix(storageKey[:i+len("/clusters")], "/")
+	resolver := mcstorage.KeyLayoutPlacementResolver{KindRootPrefix: root}
+	cid, ok := resolver.ClusterFromStorageKey(storageKey)
+	if !ok {
+		return ""
+	}
+	return cid
+}
+
+func UnwrapObject(obj interface{}) interface{} {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+	if entry, ok := obj.(*mcstorage.InternalEntry); ok && entry != nil {
+		if entry.Object != nil {
+			return entry.Object
+		}
+		return nil
+	}
+	return obj
 }
 
 func FilteredByCluster(indexer cache.Indexer, clusterID string) []interface{} {
@@ -62,17 +115,24 @@ func FilteredByCluster(indexer cache.Indexer, clusterID string) []interface{} {
 	if err != nil {
 		return nil
 	}
-	return items
+	out := make([]interface{}, 0, len(items))
+	for _, item := range items {
+		unwrapped := UnwrapObject(item)
+		if unwrapped == nil {
+			continue
+		}
+		out = append(out, unwrapped)
+	}
+	return out
 }
 
-func NewFilteredSharedIndexInformer(shared cache.SharedIndexInformer, clusterID, clusterLabelKey string) cache.SharedIndexInformer {
-	return &filteredSharedIndexInformer{shared: shared, clusterID: clusterID, clusterLabelKey: clusterLabelKey}
+func NewFilteredSharedIndexInformer(shared cache.SharedIndexInformer, clusterID string) cache.SharedIndexInformer {
+	return &filteredSharedIndexInformer{shared: shared, clusterID: clusterID}
 }
 
 type filteredSharedIndexInformer struct {
-	shared          cache.SharedIndexInformer
-	clusterID       string
-	clusterLabelKey string
+	shared    cache.SharedIndexInformer
+	clusterID string
 }
 
 func (f *filteredSharedIndexInformer) AddEventHandler(handler cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
@@ -122,25 +182,37 @@ func (f *filteredSharedIndexInformer) wrap(handler cache.ResourceEventHandler) c
 	}
 	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			if ObjectCluster(obj, f.clusterLabelKey) == f.clusterID {
-				handler.OnAdd(obj, false)
+			if ObjectCluster(obj) == f.clusterID {
+				if unwrapped := UnwrapObject(obj); unwrapped != nil {
+					handler.OnAdd(unwrapped, false)
+				}
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			oldMatch := ObjectCluster(oldObj, f.clusterLabelKey) == f.clusterID
-			newMatch := ObjectCluster(newObj, f.clusterLabelKey) == f.clusterID
+			oldMatch := ObjectCluster(oldObj) == f.clusterID
+			newMatch := ObjectCluster(newObj) == f.clusterID
 			switch {
 			case oldMatch && newMatch:
-				handler.OnUpdate(oldObj, newObj)
+				oldUnwrapped := UnwrapObject(oldObj)
+				newUnwrapped := UnwrapObject(newObj)
+				if oldUnwrapped != nil && newUnwrapped != nil {
+					handler.OnUpdate(oldUnwrapped, newUnwrapped)
+				}
 			case !oldMatch && newMatch:
-				handler.OnAdd(newObj, false)
+				if unwrapped := UnwrapObject(newObj); unwrapped != nil {
+					handler.OnAdd(unwrapped, false)
+				}
 			case oldMatch && !newMatch:
-				handler.OnDelete(oldObj)
+				if unwrapped := UnwrapObject(oldObj); unwrapped != nil {
+					handler.OnDelete(unwrapped)
+				}
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			if ObjectCluster(obj, f.clusterLabelKey) == f.clusterID {
-				handler.OnDelete(obj)
+			if ObjectCluster(obj) == f.clusterID {
+				if unwrapped := UnwrapObject(obj); unwrapped != nil {
+					handler.OnDelete(unwrapped)
+				}
 			}
 		},
 	}

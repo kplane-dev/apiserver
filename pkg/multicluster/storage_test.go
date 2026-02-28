@@ -272,8 +272,8 @@ func TestCreateEnforcesClusterLabel(t *testing.T) {
 	if !ok || got == nil {
 		t.Fatalf("expected recorded configmap create object")
 	}
-	if got.Labels[DefaultClusterAnnotation] != "c1" {
-		t.Fatalf("expected cluster label c1, got %q", got.Labels[DefaultClusterAnnotation])
+	if ObjectClusterIdentity(got) != "" {
+		t.Fatalf("expected no object metadata cluster identity, got %q", ObjectClusterIdentity(got))
 	}
 }
 
@@ -328,7 +328,7 @@ func TestGuaranteedUpdateEnforcesClusterLabel(t *testing.T) {
 	if !ok || got == nil {
 		t.Fatalf("expected recorded updated configmap")
 	}
-	if got.Labels[DefaultClusterAnnotation] != "c2" {
-		t.Fatalf("expected cluster label c2, got %q", got.Labels[DefaultClusterAnnotation])
+	if ObjectClusterIdentity(got) != "" {
+		t.Fatalf("expected no object metadata cluster identity, got %q", ObjectClusterIdentity(got))
 	}
 }

@@ -5,8 +5,8 @@ import (
 	"reflect"
 	"strings"
 
-	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
 	"github.com/kplane-dev/apiserver/pkg/multicluster/scopedinformer"
+	mcstorage "github.com/kplane-dev/apiserver/pkg/multicluster/storage"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
@@ -20,19 +20,14 @@ const sharedNamespaceNamePrefix = "__mcns__"
 
 type scopedFactory struct {
 	informers.SharedInformerFactory
-	clusterID       string
-	clusterLabelKey string
-	shared          informers.SharedInformerFactory
+	clusterID string
+	shared    informers.SharedInformerFactory
 }
 
-func newScopedFactory(clusterID, clusterLabelKey string, shared informers.SharedInformerFactory) informers.SharedInformerFactory {
-	if clusterLabelKey == "" {
-		clusterLabelKey = mc.DefaultClusterAnnotation
-	}
+func newScopedFactory(clusterID string, shared informers.SharedInformerFactory) informers.SharedInformerFactory {
 	return &scopedFactory{
 		SharedInformerFactory: shared,
 		clusterID:             clusterID,
-		clusterLabelKey:       clusterLabelKey,
 		shared:                shared,
 	}
 }
@@ -72,7 +67,7 @@ func (v *scopedCoreV1) LimitRanges() coreinformersv1.LimitRangeInformer {
 func (v *scopedCoreV1) Namespaces() coreinformersv1.NamespaceInformer {
 	base := v.f.shared.Core().V1().Namespaces().Informer()
 	return &scopedNamespaceInformer{
-		informer: newFilteredSharedIndexInformer(base, v.f.clusterID, v.f.clusterLabelKey),
+		informer: newFilteredSharedIndexInformer(base, v.f.clusterID),
 		lister:   &scopedNamespaceLister{indexer: base.GetIndexer(), clusterID: v.f.clusterID},
 	}
 }
@@ -107,30 +102,50 @@ func (v *scopedCoreV1) ServiceAccounts() coreinformersv1.ServiceAccountInformer 
 	return v.f.SharedInformerFactory.Core().V1().ServiceAccounts()
 }
 
-func newFilteredSharedIndexInformer(shared cache.SharedIndexInformer, clusterID, clusterLabelKey string) cache.SharedIndexInformer {
-	return scopedinformer.NewFilteredSharedIndexInformer(shared, clusterID, clusterLabelKey)
+func newFilteredSharedIndexInformer(shared cache.SharedIndexInformer, clusterID string) cache.SharedIndexInformer {
+	return scopedinformer.NewFilteredSharedIndexInformer(shared, clusterID)
 }
 
-func objectCluster(obj interface{}, clusterLabelKey string) string {
-	return scopedinformer.ObjectCluster(obj, clusterLabelKey)
+func objectCluster(obj interface{}) string {
+	return scopedinformer.ObjectCluster(obj)
 }
 
 func filteredByCluster(indexer cache.Indexer, clusterID string) []interface{} {
 	return scopedinformer.FilteredByCluster(indexer, clusterID)
 }
 
-func transformNamespaceForShared(clusterLabelKey string) cache.TransformFunc {
+func transformNamespaceForShared() cache.TransformFunc {
 	return func(obj interface{}) (interface{}, error) {
-		cid := objectCluster(obj, clusterLabelKey)
+		var entry *mcstorage.InternalEntry
+		if e, ok := obj.(*mcstorage.InternalEntry); ok && e != nil {
+			entry = e
+			obj = e.Object
+		}
+		cid := objectCluster(obj)
+		if cid == "" && entry != nil {
+			cid = entry.ClusterID
+		}
 		if cid == "" {
+			if entry != nil {
+				return entry, nil
+			}
 			return obj, nil
 		}
 		ns, ok := obj.(*corev1.Namespace)
 		if !ok {
+			if entry != nil {
+				return entry, nil
+			}
 			return obj, nil
 		}
 		cp := ns.DeepCopy()
 		cp.Name = encodeSharedNamespaceName(cid, cp.Name)
+		if entry != nil {
+			cpEntry := *entry
+			cpEntry.Object = cp
+			cpEntry.ClusterID = cid
+			return &cpEntry, nil
+		}
 		return cp, nil
 	}
 }

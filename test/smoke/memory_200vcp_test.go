@@ -137,7 +137,7 @@ func exerciseClusterForMemory(ctx context.Context, t *testing.T, s *testAPIServe
 	plural := "memwidgets"
 	crdName := plural + "." + group
 	createTestCRD(ctx, t, crdClient, crdName, group, plural)
-	waitForCRDEstablished(ctx, t, crdClient, clusterID, crdName)
+			waitForCRDEstablished(ctx, t, crdClient, clusterID, crdName)
 	waitForResourcePresence(t, cs, clusterID, group+"/v1", plural, true)
 	return nil
 }

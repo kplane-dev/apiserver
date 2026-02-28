@@ -42,29 +42,24 @@ import (
 	rbaclisters "k8s.io/client-go/listers/rbac/v1"
 	"k8s.io/client-go/tools/cache"
 
-	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
 	"github.com/kplane-dev/apiserver/pkg/multicluster/scopedinformer"
+	mcstorage "github.com/kplane-dev/apiserver/pkg/multicluster/storage"
 )
 
 type scopedFactory struct {
-	clusterID       string
-	clusterLabelKey string
-	shared          informers.SharedInformerFactory
-	rbacStore       *rbacProjectionStore
+	clusterID string
+	shared    informers.SharedInformerFactory
+	rbacStore *rbacProjectionStore
 }
 
-func newScopedFactory(clusterID, clusterLabelKey string, shared informers.SharedInformerFactory, rbacStore *rbacProjectionStore) informers.SharedInformerFactory {
-	if clusterLabelKey == "" {
-		clusterLabelKey = mc.DefaultClusterAnnotation
-	}
+func newScopedFactory(clusterID string, shared informers.SharedInformerFactory, rbacStore *rbacProjectionStore) informers.SharedInformerFactory {
 	if rbacStore == nil {
-		rbacStore = newRBACProjectionStore(clusterLabelKey)
+		rbacStore = newRBACProjectionStore()
 	}
 	return &scopedFactory{
-		clusterID:       clusterID,
-		clusterLabelKey: clusterLabelKey,
-		shared:          shared,
-		rbacStore:       rbacStore,
+		clusterID: clusterID,
+		shared:    shared,
+		rbacStore: rbacStore,
 	}
 }
 
@@ -181,8 +176,8 @@ func (v *scopedCoreV1) Namespaces() coreinformersv1.NamespaceInformer {
 func (v *scopedCoreV1) Nodes() coreinformersv1.NodeInformer {
 	base := v.f.shared.Core().V1().Nodes().Informer()
 	return &scopedNodeInformer{
-		informer: newFilteredSharedIndexInformer(base, v.f.clusterID, v.f.clusterLabelKey),
-		lister:   &scopedNodeLister{indexer: base.GetIndexer(), clusterID: v.f.clusterID, clusterLabelKey: v.f.clusterLabelKey},
+		informer: newFilteredSharedIndexInformer(base, v.f.clusterID),
+		lister:   &scopedNodeLister{indexer: base.GetIndexer(), clusterID: v.f.clusterID},
 	}
 }
 func (v *scopedCoreV1) PersistentVolumes() coreinformersv1.PersistentVolumeInformer {
@@ -194,8 +189,8 @@ func (v *scopedCoreV1) PersistentVolumeClaims() coreinformersv1.PersistentVolume
 func (v *scopedCoreV1) Pods() coreinformersv1.PodInformer {
 	base := v.f.shared.Core().V1().Pods().Informer()
 	return &scopedPodInformer{
-		informer: newFilteredSharedIndexInformer(base, v.f.clusterID, v.f.clusterLabelKey),
-		lister:   &scopedPodLister{indexer: base.GetIndexer(), clusterID: v.f.clusterID, clusterLabelKey: v.f.clusterLabelKey},
+		informer: newFilteredSharedIndexInformer(base, v.f.clusterID),
+		lister:   &scopedPodLister{indexer: base.GetIndexer(), clusterID: v.f.clusterID},
 	}
 }
 func (v *scopedCoreV1) PodTemplates() coreinformersv1.PodTemplateInformer {
@@ -210,8 +205,8 @@ func (v *scopedCoreV1) ResourceQuotas() coreinformersv1.ResourceQuotaInformer {
 func (v *scopedCoreV1) Secrets() coreinformersv1.SecretInformer {
 	base := v.f.shared.Core().V1().Secrets().Informer()
 	return &scopedSecretInformer{
-		informer: newFilteredSharedIndexInformer(base, v.f.clusterID, v.f.clusterLabelKey),
-		lister:   &scopedSecretLister{indexer: base.GetIndexer(), clusterID: v.f.clusterID, clusterLabelKey: v.f.clusterLabelKey},
+		informer: newFilteredSharedIndexInformer(base, v.f.clusterID),
+		lister:   &scopedSecretLister{indexer: base.GetIndexer(), clusterID: v.f.clusterID},
 	}
 }
 func (v *scopedCoreV1) Services() coreinformersv1.ServiceInformer {
@@ -220,8 +215,8 @@ func (v *scopedCoreV1) Services() coreinformersv1.ServiceInformer {
 func (v *scopedCoreV1) ServiceAccounts() coreinformersv1.ServiceAccountInformer {
 	base := v.f.shared.Core().V1().ServiceAccounts().Informer()
 	return &scopedServiceAccountInformer{
-		informer: newFilteredSharedIndexInformer(base, v.f.clusterID, v.f.clusterLabelKey),
-		lister:   &scopedServiceAccountLister{indexer: base.GetIndexer(), clusterID: v.f.clusterID, clusterLabelKey: v.f.clusterLabelKey},
+		informer: newFilteredSharedIndexInformer(base, v.f.clusterID),
+		lister:   &scopedServiceAccountLister{indexer: base.GetIndexer(), clusterID: v.f.clusterID},
 	}
 }
 
@@ -242,38 +237,38 @@ type scopedRbacV1 struct{ f *scopedFactory }
 func (v *scopedRbacV1) ClusterRoleBindings() rbacinformersv1.ClusterRoleBindingInformer {
 	base := v.f.shared.Rbac().V1().ClusterRoleBindings().Informer()
 	return &scopedClusterRoleBindingInformer{
-		informer: newFilteredSharedIndexInformer(base, v.f.clusterID, v.f.clusterLabelKey),
+		informer: newFilteredSharedIndexInformer(base, v.f.clusterID),
 		lister:   &scopedClusterRoleBindingLister{store: v.f.rbacStore, clusterID: v.f.clusterID},
 	}
 }
 func (v *scopedRbacV1) ClusterRoles() rbacinformersv1.ClusterRoleInformer {
 	base := v.f.shared.Rbac().V1().ClusterRoles().Informer()
 	return &scopedClusterRoleInformer{
-		informer: newFilteredSharedIndexInformer(base, v.f.clusterID, v.f.clusterLabelKey),
+		informer: newFilteredSharedIndexInformer(base, v.f.clusterID),
 		lister:   &scopedClusterRoleLister{store: v.f.rbacStore, clusterID: v.f.clusterID},
 	}
 }
 func (v *scopedRbacV1) RoleBindings() rbacinformersv1.RoleBindingInformer {
 	base := v.f.shared.Rbac().V1().RoleBindings().Informer()
 	return &scopedRoleBindingInformer{
-		informer: newFilteredSharedIndexInformer(base, v.f.clusterID, v.f.clusterLabelKey),
+		informer: newFilteredSharedIndexInformer(base, v.f.clusterID),
 		lister:   &scopedRoleBindingLister{store: v.f.rbacStore, clusterID: v.f.clusterID},
 	}
 }
 func (v *scopedRbacV1) Roles() rbacinformersv1.RoleInformer {
 	base := v.f.shared.Rbac().V1().Roles().Informer()
 	return &scopedRoleInformer{
-		informer: newFilteredSharedIndexInformer(base, v.f.clusterID, v.f.clusterLabelKey),
+		informer: newFilteredSharedIndexInformer(base, v.f.clusterID),
 		lister:   &scopedRoleLister{store: v.f.rbacStore, clusterID: v.f.clusterID},
 	}
 }
 
-func newFilteredSharedIndexInformer(shared cache.SharedIndexInformer, clusterID, clusterLabelKey string) cache.SharedIndexInformer {
-	return scopedinformer.NewFilteredSharedIndexInformer(shared, clusterID, clusterLabelKey)
+func newFilteredSharedIndexInformer(shared cache.SharedIndexInformer, clusterID string) cache.SharedIndexInformer {
+	return scopedinformer.NewFilteredSharedIndexInformer(shared, clusterID)
 }
 
-func objectCluster(obj interface{}, clusterLabelKey string) string {
-	return scopedinformer.ObjectCluster(obj, clusterLabelKey)
+func objectCluster(obj interface{}) string {
+	return scopedinformer.ObjectCluster(obj)
 }
 
 func filteredByCluster(indexer cache.Indexer, clusterID string) []interface{} {
@@ -282,23 +277,89 @@ func filteredByCluster(indexer cache.Indexer, clusterID string) []interface{} {
 
 type rbacProjectionStore struct {
 	mu              sync.RWMutex
-	clusterLabelKey string
 	clusterRoles    map[string]*rbacv1.ClusterRole
 	clusterBindings map[string]*rbacv1.ClusterRoleBinding
 	roles           map[string]*rbacv1.Role
 	roleBindings    map[string]*rbacv1.RoleBinding
 }
 
-func newRBACProjectionStore(clusterLabelKey string) *rbacProjectionStore {
-	if clusterLabelKey == "" {
-		clusterLabelKey = mc.DefaultClusterAnnotation
-	}
+type clusterResolver func(rv, namespace, name string) string
+
+func newRBACProjectionStore() *rbacProjectionStore {
 	return &rbacProjectionStore{
-		clusterLabelKey: clusterLabelKey,
 		clusterRoles:    map[string]*rbacv1.ClusterRole{},
 		clusterBindings: map[string]*rbacv1.ClusterRoleBinding{},
 		roles:           map[string]*rbacv1.Role{},
 		roleBindings:    map[string]*rbacv1.RoleBinding{},
+	}
+}
+
+func (s *rbacProjectionStore) RebuildFromInformerStores(roleObjs, roleBindingObjs, clusterRoleObjs, clusterRoleBindingObjs []interface{}) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.clusterRoles = map[string]*rbacv1.ClusterRole{}
+	s.clusterBindings = map[string]*rbacv1.ClusterRoleBinding{}
+	s.roles = map[string]*rbacv1.Role{}
+	s.roleBindings = map[string]*rbacv1.RoleBinding{}
+	s.mu.Unlock()
+
+	for _, obj := range roleObjs {
+		s.upsertRole(obj)
+	}
+	for _, obj := range roleBindingObjs {
+		s.upsertRoleBinding(obj)
+	}
+	for _, obj := range clusterRoleObjs {
+		s.upsertClusterRole(obj)
+	}
+	for _, obj := range clusterRoleBindingObjs {
+		s.upsertClusterRoleBinding(obj)
+	}
+}
+
+func (s *rbacProjectionStore) RebuildFromInformerStoresWithResolver(
+	roleObjs, roleBindingObjs, clusterRoleObjs, clusterRoleBindingObjs []interface{},
+	roleCluster, roleBindingCluster, clusterRoleCluster, clusterRoleBindingCluster clusterResolver,
+) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.clusterRoles = map[string]*rbacv1.ClusterRole{}
+	s.clusterBindings = map[string]*rbacv1.ClusterRoleBinding{}
+	s.roles = map[string]*rbacv1.Role{}
+	s.roleBindings = map[string]*rbacv1.RoleBinding{}
+	s.mu.Unlock()
+
+	for _, obj := range roleObjs {
+		r, ok := tombstoneObj(obj).(*rbacv1.Role)
+		if !ok || r == nil || roleCluster == nil {
+			continue
+		}
+		s.upsertRoleWithCluster(r, roleCluster(r.ResourceVersion, r.Namespace, r.Name))
+	}
+	for _, obj := range roleBindingObjs {
+		rb, ok := tombstoneObj(obj).(*rbacv1.RoleBinding)
+		if !ok || rb == nil || roleBindingCluster == nil {
+			continue
+		}
+		s.upsertRoleBindingWithCluster(rb, roleBindingCluster(rb.ResourceVersion, rb.Namespace, rb.Name))
+	}
+	for _, obj := range clusterRoleObjs {
+		cr, ok := tombstoneObj(obj).(*rbacv1.ClusterRole)
+		if !ok || cr == nil || clusterRoleCluster == nil {
+			continue
+		}
+		s.upsertClusterRoleWithCluster(cr, clusterRoleCluster(cr.ResourceVersion, "", cr.Name))
+	}
+	for _, obj := range clusterRoleBindingObjs {
+		crb, ok := tombstoneObj(obj).(*rbacv1.ClusterRoleBinding)
+		if !ok || crb == nil || clusterRoleBindingCluster == nil {
+			continue
+		}
+		s.upsertClusterRoleBindingWithCluster(crb, clusterRoleBindingCluster(crb.ResourceVersion, "", crb.Name))
 	}
 }
 
@@ -326,12 +387,11 @@ func registerRBACProjectionHandlers(store *rbacProjectionStore, roleInf, roleBin
 	return nil
 }
 
-func (s *rbacProjectionStore) objectKey(obj runtime.Object) string {
+func (s *rbacProjectionStore) objectKey(obj runtime.Object, clusterID string) string {
 	acc, err := meta.Accessor(obj)
 	if err != nil {
 		return ""
 	}
-	clusterID := acc.GetLabels()[s.clusterLabelKey]
 	if clusterID == "" {
 		return ""
 	}
@@ -342,15 +402,26 @@ func tombstoneObj(obj interface{}) interface{} {
 	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		return tombstone.Obj
 	}
+	if entry, ok := obj.(*mcstorage.InternalEntry); ok && entry != nil {
+		return entry.Object
+	}
 	return obj
 }
 
 func (s *rbacProjectionStore) upsertClusterRole(obj interface{}) {
+	clusterID := objectCluster(obj)
 	cr, ok := tombstoneObj(obj).(*rbacv1.ClusterRole)
 	if !ok || cr == nil {
 		return
 	}
-	key := s.objectKey(cr)
+	s.upsertClusterRoleWithCluster(cr, clusterID)
+}
+
+func (s *rbacProjectionStore) upsertClusterRoleWithCluster(cr *rbacv1.ClusterRole, clusterID string) {
+	if cr == nil {
+		return
+	}
+	key := s.objectKey(cr, clusterID)
 	if key == "" {
 		return
 	}
@@ -360,11 +431,12 @@ func (s *rbacProjectionStore) upsertClusterRole(obj interface{}) {
 }
 
 func (s *rbacProjectionStore) deleteClusterRole(obj interface{}) {
+	clusterID := objectCluster(obj)
 	cr, ok := tombstoneObj(obj).(*rbacv1.ClusterRole)
 	if !ok || cr == nil {
 		return
 	}
-	key := s.objectKey(cr)
+	key := s.objectKey(cr, clusterID)
 	if key == "" {
 		return
 	}
@@ -374,11 +446,19 @@ func (s *rbacProjectionStore) deleteClusterRole(obj interface{}) {
 }
 
 func (s *rbacProjectionStore) upsertClusterRoleBinding(obj interface{}) {
+	clusterID := objectCluster(obj)
 	crb, ok := tombstoneObj(obj).(*rbacv1.ClusterRoleBinding)
 	if !ok || crb == nil {
 		return
 	}
-	key := s.objectKey(crb)
+	s.upsertClusterRoleBindingWithCluster(crb, clusterID)
+}
+
+func (s *rbacProjectionStore) upsertClusterRoleBindingWithCluster(crb *rbacv1.ClusterRoleBinding, clusterID string) {
+	if crb == nil {
+		return
+	}
+	key := s.objectKey(crb, clusterID)
 	if key == "" {
 		return
 	}
@@ -388,11 +468,12 @@ func (s *rbacProjectionStore) upsertClusterRoleBinding(obj interface{}) {
 }
 
 func (s *rbacProjectionStore) deleteClusterRoleBinding(obj interface{}) {
+	clusterID := objectCluster(obj)
 	crb, ok := tombstoneObj(obj).(*rbacv1.ClusterRoleBinding)
 	if !ok || crb == nil {
 		return
 	}
-	key := s.objectKey(crb)
+	key := s.objectKey(crb, clusterID)
 	if key == "" {
 		return
 	}
@@ -402,11 +483,19 @@ func (s *rbacProjectionStore) deleteClusterRoleBinding(obj interface{}) {
 }
 
 func (s *rbacProjectionStore) upsertRole(obj interface{}) {
+	clusterID := objectCluster(obj)
 	r, ok := tombstoneObj(obj).(*rbacv1.Role)
 	if !ok || r == nil {
 		return
 	}
-	key := s.objectKey(r)
+	s.upsertRoleWithCluster(r, clusterID)
+}
+
+func (s *rbacProjectionStore) upsertRoleWithCluster(r *rbacv1.Role, clusterID string) {
+	if r == nil {
+		return
+	}
+	key := s.objectKey(r, clusterID)
 	if key == "" {
 		return
 	}
@@ -416,11 +505,12 @@ func (s *rbacProjectionStore) upsertRole(obj interface{}) {
 }
 
 func (s *rbacProjectionStore) deleteRole(obj interface{}) {
+	clusterID := objectCluster(obj)
 	r, ok := tombstoneObj(obj).(*rbacv1.Role)
 	if !ok || r == nil {
 		return
 	}
-	key := s.objectKey(r)
+	key := s.objectKey(r, clusterID)
 	if key == "" {
 		return
 	}
@@ -430,11 +520,19 @@ func (s *rbacProjectionStore) deleteRole(obj interface{}) {
 }
 
 func (s *rbacProjectionStore) upsertRoleBinding(obj interface{}) {
+	clusterID := objectCluster(obj)
 	rb, ok := tombstoneObj(obj).(*rbacv1.RoleBinding)
 	if !ok || rb == nil {
 		return
 	}
-	key := s.objectKey(rb)
+	s.upsertRoleBindingWithCluster(rb, clusterID)
+}
+
+func (s *rbacProjectionStore) upsertRoleBindingWithCluster(rb *rbacv1.RoleBinding, clusterID string) {
+	if rb == nil {
+		return
+	}
+	key := s.objectKey(rb, clusterID)
 	if key == "" {
 		return
 	}
@@ -444,11 +542,12 @@ func (s *rbacProjectionStore) upsertRoleBinding(obj interface{}) {
 }
 
 func (s *rbacProjectionStore) deleteRoleBinding(obj interface{}) {
+	clusterID := objectCluster(obj)
 	rb, ok := tombstoneObj(obj).(*rbacv1.RoleBinding)
 	if !ok || rb == nil {
 		return
 	}
-	key := s.objectKey(rb)
+	key := s.objectKey(rb, clusterID)
 	if key == "" {
 		return
 	}
@@ -726,9 +825,8 @@ func (i *scopedNodeInformer) Informer() cache.SharedIndexInformer { return i.inf
 func (i *scopedNodeInformer) Lister() corelisters.NodeLister      { return i.lister }
 
 type scopedSecretLister struct {
-	indexer         cache.Indexer
-	clusterID       string
-	clusterLabelKey string
+	indexer   cache.Indexer
+	clusterID string
 }
 
 func (l *scopedSecretLister) List(sel labels.Selector) (ret []*corev1.Secret, err error) {
@@ -775,9 +873,8 @@ func (l *scopedSecretNamespaceLister) Get(name string) (*corev1.Secret, error) {
 }
 
 type scopedServiceAccountLister struct {
-	indexer         cache.Indexer
-	clusterID       string
-	clusterLabelKey string
+	indexer   cache.Indexer
+	clusterID string
 }
 
 func (l *scopedServiceAccountLister) List(sel labels.Selector) (ret []*corev1.ServiceAccount, err error) {
@@ -824,9 +921,8 @@ func (l *scopedServiceAccountNamespaceLister) Get(name string) (*corev1.ServiceA
 }
 
 type scopedPodLister struct {
-	indexer         cache.Indexer
-	clusterID       string
-	clusterLabelKey string
+	indexer   cache.Indexer
+	clusterID string
 }
 
 func (l *scopedPodLister) List(sel labels.Selector) (ret []*corev1.Pod, err error) {
@@ -873,9 +969,8 @@ func (l *scopedPodNamespaceLister) Get(name string) (*corev1.Pod, error) {
 }
 
 type scopedNodeLister struct {
-	indexer         cache.Indexer
-	clusterID       string
-	clusterLabelKey string
+	indexer   cache.Indexer
+	clusterID string
 }
 
 func (l *scopedNodeLister) List(sel labels.Selector) (ret []*corev1.Node, err error) {
