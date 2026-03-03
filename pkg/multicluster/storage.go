@@ -222,8 +222,7 @@ func (c *clusteredStorage) Get(ctx context.Context, key string, opts storage.Get
 			return err
 		}
 		entry.StorageKey = rewrittenKey
-		resolver := mcstorage.KeyLayoutPlacementResolver{KindRootPrefix: c.kindRootPrefix()}
-		if cid, ok := resolver.ClusterFromStorageKey(rewrittenKey); ok {
+		if cid := extstorage.DefaultKeyLayout().ClusterFromKey(rewrittenKey); cid != "" {
 			entry.ClusterID = cid
 		}
 		return nil
@@ -364,8 +363,7 @@ func (c *clusteredStorage) clusterFromObject(obj runtime.Object) string {
 			return entry.ClusterID
 		}
 		if entry.StorageKey != "" {
-			resolver := mcstorage.KeyLayoutPlacementResolver{KindRootPrefix: c.kindRootPrefix()}
-			if cid, ok := resolver.ClusterFromStorageKey(entry.StorageKey); ok && cid != "" {
+			if cid := extstorage.DefaultKeyLayout().ClusterFromKey(entry.StorageKey); cid != "" {
 				return cid
 			}
 		}
