@@ -31,6 +31,9 @@ type Options struct {
 	OnClusterSelected func(clusterID string)
 	// ServerName identifies the apiserver instance using this options set (for metrics/logging).
 	ServerName string
+	// InformerRegistry provides MultiClusterInformer instances for resource types.
+	// Set by config.go and used by storage.go to register clusteredStorage instances.
+	InformerRegistry *InformerRegistry
 }
 
 // ResourceScope defines which keyspace view a request should use.

@@ -49,8 +49,8 @@ func (i *CRDServesIndex) RebuildCluster(clusterID string, objs []interface{}) {
 	i.crdKeys[clusterID] = map[string][]string{}
 
 	for _, obj := range objs {
-		crd, ok := crdFromObj(obj)
-		if !ok {
+		crd, ok := obj.(*apiextensionsv1.CustomResourceDefinition)
+		if !ok || crd == nil {
 			continue
 		}
 		keys := ServedKeysForCRD(clusterID, crd)

@@ -20,6 +20,9 @@ coverage.*
 *.coverprofile
 profile.cov
 
+# Profiling artifacts
+dev/profiles/
+
 # Dependency directories (remove the comment below to include it)
 # vendor/
 

@@ -50,7 +50,7 @@ import (
 	_ "k8s.io/component-base/metrics/prometheus/workqueue"
 	"k8s.io/component-base/term"
 	"k8s.io/component-base/version/verflag"
-	"k8s.io/component-base/zpages/flagz"
+	"k8s.io/apiserver/pkg/server/flagz"
 	"k8s.io/klog/v2"
 	aggregatorapiserver "k8s.io/kube-aggregator/pkg/apiserver"
 	"k8s.io/kubernetes/pkg/capabilities"

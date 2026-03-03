@@ -6,8 +6,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/admission/plugin/cel"
 	"k8s.io/apiserver/pkg/cel/environment"
-	"k8s.io/apiserver/pkg/features"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
 )
@@ -113,7 +111,7 @@ func (r *CelRuntime) CacheSize() int {
 
 func (r *CelRuntime) baseEnvSet() (*environment.EnvSet, error) {
 	r.baseOnce.Do(func() {
-		r.base = environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion(), utilfeature.DefaultFeatureGate.Enabled(features.StrictCostEnforcementForWebhooks))
+		r.base = environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion())
 	})
 	return r.base, r.baseErr
 }

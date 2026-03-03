@@ -1,31 +1,13 @@
 package storage
 
 import (
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	extstorage "github.com/kplane-dev/storage"
 )
 
-// InternalEntry carries key-aware multicluster metadata for storage/cache paths.
-// It is never serialized to API clients.
-type InternalEntry struct {
-	Object        runtime.Object
-	ClusterID     string
-	StorageKey    string
-	LayoutVersion string
-}
-
-func (e *InternalEntry) DeepCopyObject() runtime.Object {
-	if e == nil {
-		return nil
-	}
-	out := *e
-	if e.Object != nil {
-		out.Object = e.Object.DeepCopyObject()
-	}
-	return &out
-}
-
-func (e *InternalEntry) GetObjectKind() schema.ObjectKind {
-	return schema.EmptyObjectKind
-}
-
+// InternalEntry is a type alias for the canonical ObjectWithClusterIdentity
+// from the kplane-dev/storage module. It carries cluster identity metadata
+// for storage/cache paths and is never serialized to API clients.
+//
+// The alias preserves backward compatibility: existing type assertions like
+// *mcstorage.InternalEntry continue to work since Go aliases are identical types.
+type InternalEntry = extstorage.ObjectWithClusterIdentity

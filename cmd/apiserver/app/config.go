@@ -127,7 +127,8 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		mcOpts.DefaultCluster = opts.RootControlPlaneName
 	}
 	clientPool := mc.NewClientPool(genericConfig.LoopbackClientConfig, mcOpts.PathPrefix, mcOpts.ControlPlaneSegment)
-	informerPool := mc.NewInformerPoolFromClientPool(clientPool, 0, genericConfig.DrainedNotify())
+	informerRegistry := mc.NewInformerRegistry(wait.ContextForChannel(genericConfig.DrainedNotify()))
+	mcOpts.InformerRegistry = informerRegistry
 	var crdRuntimeMgr *mcbootstrap.CRDRuntimeManager
 	systemNamespaceBootstrapper := mcbootstrap.NewSystemNamespaceBootstrapper(mcbootstrap.SystemNamespaceOptions{
 		ClientForCluster: clientPool.KubeClientForCluster,
@@ -179,14 +180,12 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		BaseLoopbackClientConfig: genericConfig.LoopbackClientConfig,
 		PathPrefix:               mcOpts.PathPrefix,
 		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
-		EtcdPrefix:               storageFactory.StorageConfig.Prefix,
-		EtcdTransport:            storageFactory.StorageConfig.Transport,
 		Authentication:           opts.Authentication,
 		Authorization:            opts.Authorization,
 		EgressSelector:           genericConfig.EgressSelector,
 		APIServerID:              genericConfig.APIServerID,
 		ClientPool:               clientPool,
-		InformerPool:             informerPool,
+		InformerRegistry:         informerRegistry,
 	})
 	if genericConfig.Authentication.Authenticator != nil {
 		genericConfig.Authentication.Authenticator = mcauth.NewClusterAuthenticator(mcOpts.DefaultCluster, genericConfig.Authentication.Authenticator, authManager)
@@ -210,7 +209,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		PathPrefix:               mcOpts.PathPrefix,
 		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
 		ClientPool:               clientPool,
-		InformerPool:             informerPool,
+		InformerRegistry:         informerRegistry,
 	})
 	mcNamespaceLifecycle := mcnsl.NewLifecycle(mcOpts, mcNamespaceMgr)
 
@@ -240,11 +239,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		targetPort = opts.SecureServing.BindPort
 	}
 	stopChForCluster := func(clusterID string) (<-chan struct{}, error) {
-		_, _, stopCh, err := informerPool.Get(clusterID)
-		if err != nil {
-			return nil, err
-		}
-		return stopCh, nil
+		return genericConfig.DrainedNotify(), nil
 	}
 	internalControllerMgr := mcbootstrap.NewInternalControllerManager(mcbootstrap.InternalControllerOptions{
 		ClientForCluster: clientPool.KubeClientForCluster,
@@ -292,7 +287,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
 		CelRuntime:               celRuntime,
 		ClientPool:               clientPool,
-		InformerPool:             informerPool,
+		InformerRegistry:         informerRegistry,
 	})
 	mcMutatingWebhook := mcwh.NewMutating(mcOpts, mcWebhookMgr)
 	mcValidatingWebhook := mcwh.NewValidating(mcOpts, mcWebhookMgr)
@@ -321,16 +316,12 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	if apiExtensions.ExtraConfig.CRDRESTOptionsGetter != nil {
 		apiExtensions.ExtraConfig.CRDRESTOptionsGetter = decorateRESTOptionsGetter("apiextensions-crd", apiExtensions.ExtraConfig.CRDRESTOptionsGetter, mcOpts)
 	}
-	apiExtensionsClientPool := mc.NewAPIExtensionsClientPool(apiExtensions.GenericConfig.LoopbackClientConfig, mcOpts.PathPrefix, mcOpts.ControlPlaneSegment)
-	apiExtensionsInformerPool := mc.NewAPIExtensionsInformerPoolFromClientPool(apiExtensionsClientPool, 0, genericConfig.DrainedNotify())
 	crdRuntimeMgr = mcbootstrap.NewCRDRuntimeManager(mcbootstrap.CRDRuntimeManagerOptions{
-		BaseAPIExtensionsConfig:   apiExtensions,
-		APIExtensionsInformerPool: apiExtensionsInformerPool,
-		PathPrefix:                mcOpts.PathPrefix,
-		ControlPlaneSegment:       mcOpts.ControlPlaneSegment,
-		DefaultCluster:            mcOpts.DefaultCluster,
-		EtcdPrefix:                storageFactory.StorageConfig.Prefix,
-		EtcdTransport:             storageFactory.StorageConfig.Transport,
+		BaseAPIExtensionsConfig: apiExtensions,
+		InformerRegistry:        informerRegistry,
+		PathPrefix:              mcOpts.PathPrefix,
+		ControlPlaneSegment:     mcOpts.ControlPlaneSegment,
+		DefaultCluster:          mcOpts.DefaultCluster,
 	})
 	setCRDRequestResolvers(apiExtensions, crdRuntimeMgr.CRDGetterForRequest, crdRuntimeMgr.CRDListerForRequest)
 	crdController := mcbootstrap.NewMulticlusterCRDController(crdRuntimeMgr, mcOpts.DefaultCluster)
