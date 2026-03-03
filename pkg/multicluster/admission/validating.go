@@ -2,11 +2,9 @@ package admission
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	mcv1 "github.com/kplane-dev/apiserver/pkg/multicluster"
-	"k8s.io/apimachinery/pkg/api/meta"
 	apiserveradmission "k8s.io/apiserver/pkg/admission"
 )
 
@@ -31,47 +29,6 @@ func (v *Validating) Validate(ctx context.Context, a apiserveradmission.Attribut
 	gvk := a.GetKind()
 	if gvk.Group == "authorization.k8s.io" || gvk.Group == "authentication.k8s.io" || strings.HasSuffix(gvk.Kind, "Review") {
 		return nil
-	}
-	key := v.Options.ClusterAnnotationKey
-	if key == "" {
-		key = mcv1.DefaultClusterAnnotation
-	}
-	reqCID, _, _ := mcv1.FromContext(ctx)
-	if reqCID == "" {
-		reqCID = v.Options.DefaultCluster
-	}
-
-	if a.GetOperation() == apiserveradmission.Create {
-		obj := a.GetObject()
-		if obj == nil {
-			return nil
-		}
-		acc, err := meta.Accessor(obj)
-		if err != nil {
-			return nil
-		}
-		if cid := acc.GetLabels()[key]; cid != reqCID {
-			return fmt.Errorf("cluster label %q=%q must match request cluster %q", key, cid, reqCID)
-		}
-		return nil
-	}
-
-	if a.GetOperation() == apiserveradmission.Update {
-		newObj := a.GetObject()
-		oldObj := a.GetOldObject()
-		if newObj == nil || oldObj == nil {
-			return nil
-		}
-		newAcc, err1 := meta.Accessor(newObj)
-		oldAcc, err2 := meta.Accessor(oldObj)
-		if err1 != nil || err2 != nil {
-			return nil
-		}
-		oldCID := oldAcc.GetLabels()[key]
-		newCID := newAcc.GetLabels()[key]
-		if (oldCID != "" && oldCID != reqCID) || (newCID != "" && newCID != oldCID) {
-			return fmt.Errorf("cross-cluster updates are forbidden (old=%q new=%q request=%q)", oldCID, newCID, reqCID)
-		}
 	}
 	return nil
 }

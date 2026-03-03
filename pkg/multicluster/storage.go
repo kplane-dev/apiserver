@@ -12,7 +12,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
@@ -27,6 +26,8 @@ import (
 	"k8s.io/component-base/metrics/legacyregistry"
 
 	"github.com/kplane-dev/apiserver/pkg/multicluster/internalcap"
+	mcstorage "github.com/kplane-dev/apiserver/pkg/multicluster/storage"
+	extstorage "github.com/kplane-dev/storage"
 )
 
 // RESTOptionsDecorator wraps the underlying getter to inject a decorator that
@@ -65,10 +66,15 @@ func (w RESTOptionsDecorator) GetRESTOptions(resource schema.GroupResource, exam
 	if err != nil {
 		return opts, err
 	}
-	base := opts.Decorator
-	if base == nil {
-		base = generic.UndecoratedStorage
-	}
+	// Use StorageWithClusterIdentity as the base decorator instead of the
+	// default StorageWithCacher. This configures the cacher pipeline with
+	// identity hooks (IdentityFromKey, WrapWatchObject, UnwrapObject) and
+	// sets WrapDecodedObject on the etcd3 storage config so that decoded
+	// objects carry their storage key through the watch.Event boundary.
+	base := extstorage.StorageWithClusterIdentity(extstorage.DecoratorConfig{
+		KeyLayout:     extstorage.DefaultKeyLayout(),
+		GroupResource: resource,
+	})
 	base = wrapBaseDecorator(base, w.Options)
 	opts.Decorator = func(
 		config *storagebackend.ConfigForResource,
@@ -158,6 +164,9 @@ func newClusteredStorage(
 		indexers:       indexers,
 		options:        options,
 	}
+	if options.InformerRegistry != nil {
+		options.InformerRegistry.RegisterStorage(config.GroupResource, cs)
+	}
 	return cs, cs.destroy, nil
 }
 
@@ -173,7 +182,6 @@ func (c *clusteredStorage) Create(ctx context.Context, key string, obj, out runt
 	if err := c.rejectAllClustersMutation(ctx); err != nil {
 		return err
 	}
-	c.enforceObjectClusterLabel(obj, c.clusterFromContext(ctx))
 	store, key, err := c.storeAndKey(ctx, key)
 	if err != nil {
 		return err
@@ -197,15 +205,29 @@ func (c *clusteredStorage) Watch(ctx context.Context, key string, opts storage.L
 	if err != nil {
 		return nil, err
 	}
-	return store.Watch(ctx, key, opts)
+	w, err := store.Watch(ctx, key, opts)
+	if err != nil {
+		return nil, err
+	}
+	return mcstorage.NewEntryWatch(w), nil
 }
 
 func (c *clusteredStorage) Get(ctx context.Context, key string, opts storage.GetOptions, objPtr runtime.Object) error {
-	store, key, err := c.storeAndKey(ctx, key)
+	store, rewrittenKey, err := c.storeAndKey(ctx, key)
 	if err != nil {
 		return err
 	}
-	return store.Get(ctx, key, opts, objPtr)
+	if entry, ok := objPtr.(*mcstorage.InternalEntry); ok && entry != nil && entry.Object != nil {
+		if err := store.Get(ctx, rewrittenKey, opts, entry.Object); err != nil {
+			return err
+		}
+		entry.StorageKey = rewrittenKey
+		if cid := extstorage.DefaultKeyLayout().ClusterFromKey(rewrittenKey); cid != "" {
+			entry.ClusterID = cid
+		}
+		return nil
+	}
+	return store.Get(ctx, rewrittenKey, opts, objPtr)
 }
 
 func (c *clusteredStorage) GetList(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
@@ -220,20 +242,11 @@ func (c *clusteredStorage) GuaranteedUpdate(ctx context.Context, key string, des
 	if err := c.rejectAllClustersMutation(ctx); err != nil {
 		return err
 	}
-	store, key, err := c.storeAndKey(ctx, key)
+	store, rewrittenKey, err := c.storeAndKey(ctx, key)
 	if err != nil {
 		return err
 	}
-	cid := c.clusterFromContext(ctx)
-	wrappedUpdate := func(input runtime.Object, res storage.ResponseMeta) (runtime.Object, *uint64, error) {
-		outObj, ttl, err := tryUpdate(input, res)
-		if err != nil || outObj == nil {
-			return outObj, ttl, err
-		}
-		c.enforceObjectClusterLabel(outObj, cid)
-		return outObj, ttl, nil
-	}
-	return store.GuaranteedUpdate(ctx, key, destination, ignoreNotFound, precond, wrappedUpdate, cachedExistingObject)
+	return store.GuaranteedUpdate(ctx, rewrittenKey, destination, ignoreNotFound, precond, tryUpdate, cachedExistingObject)
 }
 
 func (c *clusteredStorage) Stats(ctx context.Context) (storage.Stats, error) {
@@ -268,12 +281,12 @@ func (c *clusteredStorage) GetCurrentResourceVersion(ctx context.Context) (uint6
 	return store.GetCurrentResourceVersion(ctx)
 }
 
-func (c *clusteredStorage) SetKeysFunc(keysFunc storage.KeysFunc) {
+func (c *clusteredStorage) EnableResourceSizeEstimation(keysFunc storage.KeysFunc) error {
 	store, err := c.ensureStore()
 	if err != nil {
-		return
+		return err
 	}
-	store.SetKeysFunc(keysFunc)
+	return store.EnableResourceSizeEstimation(keysFunc)
 }
 
 func (c *clusteredStorage) CompactRevision() int64 {
@@ -343,51 +356,24 @@ func (c *clusteredStorage) defaultCluster() string {
 	return DefaultClusterName
 }
 
-func (c *clusteredStorage) clusterFromContext(ctx context.Context) string {
-	cid, _, _ := FromContextScope(ctx)
-	if cid == "" {
-		cid = c.defaultCluster()
-	}
-	return cid
-}
-
-func (c *clusteredStorage) enforceObjectClusterLabel(obj runtime.Object, cid string) {
-	if obj == nil {
-		return
-	}
-	acc, err := meta.Accessor(obj)
-	if err != nil {
-		return
-	}
-	key := c.options.ClusterAnnotationKey
-	if key == "" {
-		key = DefaultClusterAnnotation
-	}
-	lbls := acc.GetLabels()
-	if lbls == nil {
-		lbls = map[string]string{}
-	}
-	lbls[key] = cid
-	acc.SetLabels(lbls)
-}
 
 func (c *clusteredStorage) clusterFromObject(obj runtime.Object) string {
-	if obj == nil {
-		return c.defaultCluster()
-	}
-	acc, err := meta.Accessor(obj)
-	if err != nil {
-		return c.defaultCluster()
-	}
-	key := c.options.ClusterAnnotationKey
-	if key == "" {
-		key = DefaultClusterAnnotation
-	}
-	if cid := acc.GetLabels()[key]; cid != "" {
-		return cid
+	if entry, ok := obj.(*mcstorage.InternalEntry); ok && entry != nil {
+		if entry.ClusterID != "" {
+			return entry.ClusterID
+		}
+		if entry.StorageKey != "" {
+			if cid := extstorage.DefaultKeyLayout().ClusterFromKey(entry.StorageKey); cid != "" {
+				return cid
+			}
+		}
+		if entry.Object != nil {
+			obj = entry.Object
+		}
 	}
 	return c.defaultCluster()
 }
+
 
 func (c *clusteredStorage) rewriteKey(cluster, key string) string {
 	if cluster == "" {
@@ -430,6 +416,14 @@ func (c *clusteredStorage) ensureStore() (storage.Interface, error) {
 		seq, server, c.resourcePrefix, kindRootPrefix, cfg.Prefix, hex.EncodeToString(stackHash[:8]),
 	)
 	keyFunc := func(obj runtime.Object) (string, error) {
+		if entry, ok := obj.(*mcstorage.InternalEntry); ok && entry != nil {
+			if entry.StorageKey != "" {
+				return entry.StorageKey, nil
+			}
+			if entry.Object != nil {
+				obj = entry.Object
+			}
+		}
 		key, err := c.keyFunc(obj)
 		if err != nil {
 			return "", err
@@ -444,5 +438,5 @@ func (c *clusteredStorage) ensureStore() (storage.Interface, error) {
 	}
 	c.store = store
 	c.destroyFn = destroy
-	return store, nil
+	return c.store, nil
 }

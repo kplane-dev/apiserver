@@ -12,7 +12,6 @@ import (
 // EtcdPrefix must match the apiserver's configured etcd prefix (e.g. "/registry").
 // DefaultCluster is used when no cluster can be extracted.
 // PathPrefix and ControlPlaneSegment define the URL form for path-based extraction.
-// ClusterAnnotationKey is the server-owned annotation storing the cluster id.
 // ClusterFieldKey is a synthetic field name exposed via AttrFunc for selectors.
 // WatchStrategy selects shared kind-root or per-cluster watch behavior.
 // ClusterSource optionally provides cluster IDs for per-cluster watch.
@@ -24,7 +23,6 @@ type Options struct {
 	DefaultCluster       string
 	PathPrefix           string
 	ControlPlaneSegment  string
-	ClusterAnnotationKey string
 	ClusterFieldKey      string
 	WatchStrategy        WatchStrategy
 	ClusterSource        ClusterSource
@@ -33,6 +31,9 @@ type Options struct {
 	OnClusterSelected func(clusterID string)
 	// ServerName identifies the apiserver instance using this options set (for metrics/logging).
 	ServerName string
+	// InformerRegistry provides MultiClusterInformer instances for resource types.
+	// Set by config.go and used by storage.go to register clusteredStorage instances.
+	InformerRegistry *InformerRegistry
 }
 
 // ResourceScope defines which keyspace view a request should use.
@@ -54,7 +55,6 @@ const (
 	DefaultInternalCrossClusterUser       = "system:apiserver"
 	DefaultInternalCrossClusterCapability = "kplane.internal/cross-cluster-read"
 	DefaultInternalCrossClusterUserAgent  = "kplane-internal-cross-cluster"
-	DefaultClusterAnnotation              = "multicluster.k8s.io/cluster"
 	DefaultClusterField                   = "metadata.cluster"
 )
 
@@ -63,7 +63,6 @@ var DefaultOptions = Options{
 	DefaultCluster:       DefaultClusterName,
 	PathPrefix:           DefaultPathPrefix,
 	ControlPlaneSegment:  DefaultControlPlaneSegment,
-	ClusterAnnotationKey: DefaultClusterAnnotation,
 	ClusterFieldKey:      DefaultClusterField,
 	WatchStrategy:        KindRootWatch{},
 }

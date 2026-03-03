@@ -254,7 +254,7 @@ func (a *mutatingDispatcher) callAttrMutatingHook(ctx context.Context, h *admiss
 		}
 	}
 
-	uid, request, response, err := webhookrequest.CreateAdmissionObjects(attr, invocation)
+	uid, request, response, err := webhookrequest.CreateAdmissionObjects(generic.EnsureVersionedAttributesUserInfo(attr), invocation)
 	if err != nil {
 		return false, &webhookutil.ErrCallingWebhook{WebhookName: h.Name, Reason: fmt.Errorf("could not create admission objects: %w", err), Status: apierrors.NewBadRequest("error creating admission objects")}
 	}

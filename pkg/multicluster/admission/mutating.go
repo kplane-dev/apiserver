@@ -6,7 +6,6 @@ import (
 
 	mcv1 "github.com/kplane-dev/apiserver/pkg/multicluster"
 	mcauth "github.com/kplane-dev/apiserver/pkg/multicluster/auth"
-	"k8s.io/apimachinery/pkg/api/meta"
 	apiserveradmission "k8s.io/apiserver/pkg/admission"
 	authenticationapi "k8s.io/kubernetes/pkg/apis/authentication"
 )
@@ -45,27 +44,5 @@ func (m *Mutating) Admit(ctx context.Context, a apiserveradmission.Attributes, _
 	if gvk.Group == "authorization.k8s.io" || gvk.Group == "authentication.k8s.io" || strings.HasSuffix(gvk.Kind, "Review") {
 		return nil
 	}
-	obj := a.GetObject()
-	if obj == nil {
-		return nil
-	}
-	cid, _, _ := mcv1.FromContext(ctx)
-	if cid == "" {
-		cid = m.Options.DefaultCluster
-	}
-	accessor, err := meta.Accessor(obj)
-	if err != nil {
-		return nil
-	}
-	lbls := accessor.GetLabels()
-	if lbls == nil {
-		lbls = map[string]string{}
-	}
-	key := m.Options.ClusterAnnotationKey
-	if key == "" {
-		key = mcv1.DefaultClusterAnnotation
-	}
-	lbls[key] = cid
-	accessor.SetLabels(lbls)
 	return nil
 }

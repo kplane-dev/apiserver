@@ -1,18 +1,18 @@
 package webhook
 
 import (
-	"fmt"
-	"reflect"
 	"sync"
+	"time"
 
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	webhookutil "k8s.io/apiserver/pkg/util/webhook"
 	clientgoinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
 
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
-	"github.com/kplane-dev/apiserver/pkg/multicluster/scopedinformer"
+	"github.com/kplane-dev/apiserver/pkg/multicluster/typedinformer"
+	mcinformer "github.com/kplane-dev/informer"
 )
 
 type Options struct {
@@ -40,8 +40,8 @@ type Options struct {
 	// ClientPool caches per-cluster loopback clients.
 	ClientPool *mc.ClientPool
 
-	// InformerPool shares informer factories across managers per cluster.
-	InformerPool *mc.InformerPool
+	// InformerRegistry provides MultiClusterInformers for resource types.
+	InformerRegistry *mc.InformerRegistry
 }
 
 type Manager struct {
@@ -49,20 +49,11 @@ type Manager struct {
 
 	mu       sync.Mutex
 	clusters map[string]*clusterEnv
-
-	sharedOnce sync.Once
-	sharedErr  error
-	shared     clientgoinformers.SharedInformerFactory
-	sharedStop <-chan struct{}
-	sharedOwn  chan struct{}
-	sharedSync chan struct{}
 }
 
 type clusterEnv struct {
 	cid string
 
-	stopCh <-chan struct{}
-	ownCh  chan struct{}
 	synced chan struct{}
 
 	clientset kubernetes.Interface
@@ -96,112 +87,79 @@ func (m *Manager) envForCluster(clusterID string) (*clusterEnv, error) {
 	if err != nil {
 		return nil, err
 	}
-	scoped, err := m.scopedWebhookFactory(clusterID)
+
+	nsMCI, err := m.opts.InformerRegistry.Get(schema.GroupResource{Resource: "namespaces"})
 	if err != nil {
 		return nil, err
 	}
-	stopCh := make(chan struct{})
+	servicesMCI, err := m.opts.InformerRegistry.Get(schema.GroupResource{Resource: "services"})
+	if err != nil {
+		return nil, err
+	}
+	endpointSlicesMCI, err := m.opts.InformerRegistry.Get(schema.GroupResource{Group: "discovery.k8s.io", Resource: "endpointslices"})
+	if err != nil {
+		return nil, err
+	}
+	mutatingMCI, err := m.opts.InformerRegistry.Get(schema.GroupResource{Group: "admissionregistration.k8s.io", Resource: "mutatingwebhookconfigurations"})
+	if err != nil {
+		return nil, err
+	}
+	validatingMCI, err := m.opts.InformerRegistry.Get(schema.GroupResource{Group: "admissionregistration.k8s.io", Resource: "validatingwebhookconfigurations"})
+	if err != nil {
+		return nil, err
+	}
+
+	factory := typedinformer.NewMCIFactory(typedinformer.MCIFactoryConfig{
+		ClusterID:          clusterID,
+		Namespaces:         nsMCI,
+		Services:           servicesMCI,
+		EndpointSlices:     endpointSlicesMCI,
+		MutatingWebhooks:   mutatingMCI,
+		ValidatingWebhooks: validatingMCI,
+	})
 
 	sr := newDirectServiceResolver(
-		scoped.Core().V1().Services().Lister(),
-		scoped.Discovery().V1().EndpointSlices().Lister(),
+		typedinformer.NewServiceLister(servicesMCI, clusterID),
+		typedinformer.NewEndpointSliceLister(endpointSlicesMCI, clusterID),
 		m.opts.EnableAggregatorRouting,
 		m.opts.Hostname,
 	)
 
+	synced := make(chan struct{})
 	e := &clusterEnv{
 		cid:             clusterID,
-		stopCh:          stopCh,
-		ownCh:           stopCh,
-		synced:          m.sharedSync,
+		synced:          synced,
 		clientset:       cs,
-		informers:       scoped,
+		informers:       factory,
 		serviceResolver: sr,
 	}
 
-	// Warm required informers (must happen before Start()).
-	_ = scoped.Core().V1().Namespaces().Informer()
-	_ = scoped.Core().V1().Services().Informer()
-	_ = scoped.Discovery().V1().EndpointSlices().Informer()
-	_ = scoped.Admissionregistration().V1().MutatingWebhookConfigurations().Informer()
-	_ = scoped.Admissionregistration().V1().ValidatingWebhookConfigurations().Informer()
-	scoped.Start(stopCh)
+	// Close synced channel when all MCIs have completed initial sync.
+	mcis := []*mcinformer.MultiClusterInformer{nsMCI, servicesMCI, endpointSlicesMCI, mutatingMCI, validatingMCI}
+	go func() {
+		for {
+			allSynced := true
+			for _, mci := range mcis {
+				if !mci.HasSynced() {
+					allSynced = false
+					break
+				}
+			}
+			if allSynced {
+				close(synced)
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
 
 	m.clusters[clusterID] = e
 	return e, nil
-}
-
-func (m *Manager) scopedWebhookFactory(clusterID string) (clientgoinformers.SharedInformerFactory, error) {
-	shared, err := m.ensureSharedFactory()
-	if err != nil {
-		return nil, err
-	}
-	return newScopedFactory(clusterID, mc.DefaultClusterAnnotation, shared), nil
-}
-
-func (m *Manager) ensureSharedFactory() (clientgoinformers.SharedInformerFactory, error) {
-	m.sharedOnce.Do(func() {
-		if m.opts.BaseLoopbackClientConfig == nil {
-			m.sharedErr = fmt.Errorf("base loopback config is required for shared webhook factory")
-			return
-		}
-		cs, err := scopedinformer.NewAllClustersKubeClient(m.opts.BaseLoopbackClientConfig)
-		if err != nil {
-			m.sharedErr = err
-			return
-		}
-		factory := clientgoinformers.NewSharedInformerFactory(cs, 0)
-		webhookInformers := []cache.SharedIndexInformer{
-			factory.Core().V1().Namespaces().Informer(),
-			factory.Core().V1().Services().Informer(),
-			factory.Discovery().V1().EndpointSlices().Informer(),
-			factory.Admissionregistration().V1().MutatingWebhookConfigurations().Informer(),
-			factory.Admissionregistration().V1().ValidatingWebhookConfigurations().Informer(),
-		}
-		for _, inf := range webhookInformers {
-			if err := scopedinformer.EnsureClusterIndex(inf, mc.DefaultClusterAnnotation); err != nil {
-				m.sharedErr = err
-				return
-			}
-		}
-		if m.sharedStop == nil {
-			m.sharedOwn = make(chan struct{})
-			m.sharedStop = m.sharedOwn
-		}
-		factory.Start(m.sharedStop)
-		// One shared cache-sync signal for all clusters; scoped informers are projections over shared caches.
-		m.sharedSync = make(chan struct{})
-		go func() {
-			ok := factory.WaitForCacheSync(m.sharedStop)
-			if allSynced(ok) {
-				close(m.sharedSync)
-			}
-		}()
-		m.shared = factory
-	})
-	if m.sharedErr != nil {
-		return nil, m.sharedErr
-	}
-	return m.shared, nil
-}
-
-func allSynced(m map[reflect.Type]bool) bool {
-	for _, v := range m {
-		if !v {
-			return false
-		}
-	}
-	return true
 }
 
 // StopCluster is test-oriented cleanup; production can leave informers running.
 func (m *Manager) StopCluster(clusterID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if e, ok := m.clusters[clusterID]; ok {
-		if e.ownCh != nil {
-			close(e.ownCh)
-		}
-		delete(m.clusters, clusterID)
-	}
+	delete(m.clusters, clusterID)
 }

@@ -44,7 +44,7 @@ func (f *fakeStorage) RequestWatchProgress(context.Context) error   { return nil
 func (f *fakeStorage) GetCurrentResourceVersion(context.Context) (uint64, error) {
 	return 0, nil
 }
-func (f *fakeStorage) SetKeysFunc(storage.KeysFunc) {}
+func (f *fakeStorage) EnableResourceSizeEstimation(storage.KeysFunc) error { return nil }
 func (f *fakeStorage) CompactRevision() int64       { return 0 }
 
 type recordingStorage struct {
@@ -272,8 +272,8 @@ func TestCreateEnforcesClusterLabel(t *testing.T) {
 	if !ok || got == nil {
 		t.Fatalf("expected recorded configmap create object")
 	}
-	if got.Labels[DefaultClusterAnnotation] != "c1" {
-		t.Fatalf("expected cluster label c1, got %q", got.Labels[DefaultClusterAnnotation])
+	if got.Name != "cm" {
+		t.Fatalf("expected created object name 'cm', got %q", got.Name)
 	}
 }
 
@@ -328,7 +328,7 @@ func TestGuaranteedUpdateEnforcesClusterLabel(t *testing.T) {
 	if !ok || got == nil {
 		t.Fatalf("expected recorded updated configmap")
 	}
-	if got.Labels[DefaultClusterAnnotation] != "c2" {
-		t.Fatalf("expected cluster label c2, got %q", got.Labels[DefaultClusterAnnotation])
+	if got.Name != "cm" {
+		t.Fatalf("expected updated object name 'cm', got %q", got.Name)
 	}
 }

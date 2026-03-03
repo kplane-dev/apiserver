@@ -255,7 +255,7 @@ func (d *validatingDispatcher) callHook(ctx context.Context, h *v1.ValidatingWeb
 		}
 	}
 
-	uid, request, response, err := webhookrequest.CreateAdmissionObjects(versionedAttr, invocation)
+	uid, request, response, err := webhookrequest.CreateAdmissionObjects(generic.EnsureVersionedAttributesUserInfo(versionedAttr), invocation)
 	if err != nil {
 		return &webhookutil.ErrCallingWebhook{WebhookName: h.Name, Reason: fmt.Errorf("could not create admission objects: %w", err), Status: apierrors.NewBadRequest("error creating admission objects")}
 	}

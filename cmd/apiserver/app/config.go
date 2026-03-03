@@ -127,7 +127,8 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		mcOpts.DefaultCluster = opts.RootControlPlaneName
 	}
 	clientPool := mc.NewClientPool(genericConfig.LoopbackClientConfig, mcOpts.PathPrefix, mcOpts.ControlPlaneSegment)
-	informerPool := mc.NewInformerPoolFromClientPool(clientPool, 0, genericConfig.DrainedNotify())
+	informerRegistry := mc.NewInformerRegistry(wait.ContextForChannel(genericConfig.DrainedNotify()))
+	mcOpts.InformerRegistry = informerRegistry
 	var crdRuntimeMgr *mcbootstrap.CRDRuntimeManager
 	systemNamespaceBootstrapper := mcbootstrap.NewSystemNamespaceBootstrapper(mcbootstrap.SystemNamespaceOptions{
 		ClientForCluster: clientPool.KubeClientForCluster,
@@ -146,7 +147,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	})
 	genericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
-		base := server.DefaultBuildHandlerChain(h, conf)
+		base := withVersionOverride(server.DefaultBuildHandlerChain(h, conf))
 		dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cid, _, _ := mc.FromContext(r.Context())
 			if cid != "" && cid != mcOpts.DefaultCluster && crdRuntimeMgr != nil {
@@ -162,10 +163,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 						return
 					}
 					if h, err := crdRuntimeMgr.Runtime(cid, genericConfig.DrainedNotify()); err == nil && h != nil {
-						h = genericfilters.WithRequestInfo(h, conf.RequestInfoResolver)
-						h = genericfilters.WithAuditInit(h)
-						h = serverfilters.WithPanicRecovery(h, conf.RequestInfoResolver)
-						h.ServeHTTP(w, r)
+						wrapClusterCRDHandler(h, conf, cid, false).ServeHTTP(w, r)
 						return
 					}
 					klog.Errorf("mc.crdRuntime unresolved at kube cluster=%s path=%s", cid, r.URL.Path)
@@ -187,13 +185,15 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		EgressSelector:           genericConfig.EgressSelector,
 		APIServerID:              genericConfig.APIServerID,
 		ClientPool:               clientPool,
-		InformerPool:             informerPool,
+		InformerRegistry:         informerRegistry,
 	})
 	if genericConfig.Authentication.Authenticator != nil {
 		genericConfig.Authentication.Authenticator = mcauth.NewClusterAuthenticator(mcOpts.DefaultCluster, genericConfig.Authentication.Authenticator, authManager)
 	}
 	if genericConfig.Authorization.Authorizer != nil {
-		clusterAuthorizer := mcauth.NewClusterAuthorizer(mcOpts.DefaultCluster, genericConfig.Authorization.Authorizer, genericConfig.RuleResolver, authManager)
+		// Route root and tenant authorization through the same multicluster
+		// manager-backed path to avoid root-only stale lister divergence.
+		clusterAuthorizer := mcauth.NewClusterAuthorizer(mcOpts.DefaultCluster, nil, nil, authManager)
 		genericConfig.Authorization.Authorizer = clusterAuthorizer
 		genericConfig.RuleResolver = clusterAuthorizer
 	}
@@ -209,7 +209,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		PathPrefix:               mcOpts.PathPrefix,
 		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
 		ClientPool:               clientPool,
-		InformerPool:             informerPool,
+		InformerRegistry:         informerRegistry,
 	})
 	mcNamespaceLifecycle := mcnsl.NewLifecycle(mcOpts, mcNamespaceMgr)
 
@@ -239,11 +239,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		targetPort = opts.SecureServing.BindPort
 	}
 	stopChForCluster := func(clusterID string) (<-chan struct{}, error) {
-		_, _, stopCh, err := informerPool.Get(clusterID)
-		if err != nil {
-			return nil, err
-		}
-		return stopCh, nil
+		return genericConfig.DrainedNotify(), nil
 	}
 	internalControllerMgr := mcbootstrap.NewInternalControllerManager(mcbootstrap.InternalControllerOptions{
 		ClientForCluster: clientPool.KubeClientForCluster,
@@ -291,7 +287,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
 		CelRuntime:               celRuntime,
 		ClientPool:               clientPool,
-		InformerPool:             informerPool,
+		InformerRegistry:         informerRegistry,
 	})
 	mcMutatingWebhook := mcwh.NewMutating(mcOpts, mcWebhookMgr)
 	mcValidatingWebhook := mcwh.NewValidating(mcOpts, mcWebhookMgr)
@@ -317,14 +313,15 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	if apiExtensions.GenericConfig.RESTOptionsGetter != nil {
 		apiExtensions.GenericConfig.RESTOptionsGetter = decorateRESTOptionsGetter("apiextensions", apiExtensions.GenericConfig.RESTOptionsGetter, mcOpts)
 	}
-	apiExtensionsClientPool := mc.NewAPIExtensionsClientPool(apiExtensions.GenericConfig.LoopbackClientConfig, mcOpts.PathPrefix, mcOpts.ControlPlaneSegment)
-	apiExtensionsInformerPool := mc.NewAPIExtensionsInformerPoolFromClientPool(apiExtensionsClientPool, 0, genericConfig.DrainedNotify())
+	if apiExtensions.ExtraConfig.CRDRESTOptionsGetter != nil {
+		apiExtensions.ExtraConfig.CRDRESTOptionsGetter = decorateRESTOptionsGetter("apiextensions-crd", apiExtensions.ExtraConfig.CRDRESTOptionsGetter, mcOpts)
+	}
 	crdRuntimeMgr = mcbootstrap.NewCRDRuntimeManager(mcbootstrap.CRDRuntimeManagerOptions{
-		BaseAPIExtensionsConfig:   apiExtensions,
-		APIExtensionsInformerPool: apiExtensionsInformerPool,
-		PathPrefix:                mcOpts.PathPrefix,
-		ControlPlaneSegment:       mcOpts.ControlPlaneSegment,
-		DefaultCluster:            mcOpts.DefaultCluster,
+		BaseAPIExtensionsConfig: apiExtensions,
+		InformerRegistry:        informerRegistry,
+		PathPrefix:              mcOpts.PathPrefix,
+		ControlPlaneSegment:     mcOpts.ControlPlaneSegment,
+		DefaultCluster:          mcOpts.DefaultCluster,
 	})
 	setCRDRequestResolvers(apiExtensions, crdRuntimeMgr.CRDGetterForRequest, crdRuntimeMgr.CRDListerForRequest)
 	crdController := mcbootstrap.NewMulticlusterCRDController(crdRuntimeMgr, mcOpts.DefaultCluster)
@@ -361,19 +358,13 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 			http.Error(w, "cluster CRD runtime unavailable", http.StatusServiceUnavailable)
 			return true
 		}
-		// Ensure RequestInfo is computed from the normalized /apis path
-		// before entering the cluster-scoped CRD runtime handler.
-		h = genericfilters.WithRequestInfo(h, conf.RequestInfoResolver)
-		h = withClusterCRDRequestInfoRewrite(h, clusterID)
-		h = genericfilters.WithAuditInit(h)
-		h = serverfilters.WithPanicRecovery(h, conf.RequestInfoResolver)
-		h.ServeHTTP(w, r)
+		wrapClusterCRDHandler(h, conf, clusterID, false).ServeHTTP(w, r)
 		return true
 	}
 	// Ensure CRDs are also routed through the multicluster handler
 	apiExtensions.GenericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
-		base := server.DefaultBuildHandlerChain(h, conf)
+		base := withVersionOverride(server.DefaultBuildHandlerChain(h, conf))
 		dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cid, _, _ := mc.FromContext(r.Context())
 			if cid != "" && cid != mcOpts.DefaultCluster {
@@ -390,11 +381,11 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		mut := mca.NewMutating(mcOpts)
 		val := mca.NewValidating(mcOpts)
 		base := apiExtensions.GenericConfig.AdmissionControl
-		chain := []admission.Interface{mut, mcNamespaceLifecycle, mcMutatingWebhook}
+		chain := []admission.Interface{mut, mcNamespaceLifecycle}
 		if base != nil {
 			chain = append(chain, base)
 		}
-		chain = append(chain, mcValidatingWebhook, val)
+		chain = append(chain, val)
 		apiExtensions.GenericConfig.AdmissionControl = admission.NewChainHandler(chain...)
 	}
 	c.ApiExtensions = apiExtensions
@@ -409,7 +400,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	// Ensure aggregator also receives multicluster routing
 	aggregator.GenericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
-		base := server.DefaultBuildHandlerChain(h, conf)
+		base := withVersionOverride(server.DefaultBuildHandlerChain(h, conf))
 		dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cid, _, _ := mc.FromContext(r.Context())
 			if cid != "" && cid != mcOpts.DefaultCluster && crdRuntimeMgr != nil {
@@ -426,11 +417,11 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		mut := mca.NewMutating(mcOpts)
 		val := mca.NewValidating(mcOpts)
 		base := aggregator.GenericConfig.AdmissionControl
-		chain := []admission.Interface{mut, mcNamespaceLifecycle, mcMutatingWebhook}
+		chain := []admission.Interface{mut, mcNamespaceLifecycle}
 		if base != nil {
 			chain = append(chain, base)
 		}
-		chain = append(chain, mcValidatingWebhook, val)
+		chain = append(chain, val)
 		aggregator.GenericConfig.AdmissionControl = admission.NewChainHandler(chain...)
 	}
 	c.Aggregator = aggregator
@@ -478,6 +469,25 @@ func withClusterCRDRequestInfoRewrite(next http.Handler, clusterID string) http.
 		ctx := apirequest.WithRequestInfo(r.Context(), &rewritten)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func wrapClusterCRDHandler(next http.Handler, conf *server.Config, clusterID string, rewriteRequestInfo bool) http.Handler {
+	if next == nil || conf == nil {
+		return next
+	}
+	h := next
+	if rewriteRequestInfo {
+		h = withClusterCRDRequestInfoRewrite(h, clusterID)
+	}
+	h = genericfilters.WithAuthorization(h, conf.Authorization.Authorizer, conf.Serializer)
+	failedHandler := genericfilters.Unauthorized(conf.Serializer)
+	failedHandler = genericfilters.WithFailedAuthenticationAudit(failedHandler, conf.AuditBackend, conf.AuditPolicyRuleEvaluator)
+	h = genericfilters.WithAuthentication(h, conf.Authentication.Authenticator, failedHandler, conf.Authentication.APIAudiences, conf.Authentication.RequestHeaderConfig)
+	// RequestInfo must be available before rewrite/authn/authz wrappers execute.
+	h = genericfilters.WithRequestInfo(h, conf.RequestInfoResolver)
+	h = genericfilters.WithAuditInit(h)
+	h = serverfilters.WithPanicRecovery(h, conf.RequestInfoResolver)
+	return h
 }
 
 func decorateRESTOptionsGetter(server string, getter generic.RESTOptionsGetter, opts mc.Options) generic.RESTOptionsGetter {

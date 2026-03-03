@@ -63,7 +63,7 @@ func (p *LifecyclePlugin) forCluster(ctx context.Context) *upstream.Lifecycle {
 		panic(err)
 	}
 
-	plugin, err := upstream.NewLifecycle(sets.NewString(metav1.NamespaceDefault, metav1.NamespaceSystem, metav1.NamespacePublic))
+	plugin, err := upstream.NewLifecycle(sets.New[string](metav1.NamespaceDefault, metav1.NamespaceSystem, metav1.NamespacePublic))
 	if err != nil {
 		panic(err)
 	}

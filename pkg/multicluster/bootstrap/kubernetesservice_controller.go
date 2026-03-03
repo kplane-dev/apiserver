@@ -138,6 +138,11 @@ func (c *kubernetesServiceController) reconcile() error {
 	}
 
 	epClient := c.client.CoreV1().Endpoints(metav1.NamespaceDefault)
+	// Endpoint objects reject loopback addresses. In local envtest setups the
+	// loopback listener is expected; skip endpoint reconciliation in that case.
+	if c.publicIP != nil && c.publicIP.IsLoopback() {
+		return nil
+	}
 	want := &corev1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "kubernetes",

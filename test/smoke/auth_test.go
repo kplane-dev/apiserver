@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -45,12 +44,10 @@ func TestRBACIsolationAcrossClusters(t *testing.T) {
 		},
 	}, metav1.CreateOptions{})
 	if err != nil {
-		t.Fatalf("cluster=%s create clusterrole: %v", clusterA, err)
+		t.Fatalf("cluster=%s create clusterrole: %v\nlogs:\n%s", clusterA, err, s.logs())
 	}
-	if got, getErr := csA.RbacV1().ClusterRoles().Get(ctx, roleName, metav1.GetOptions{}); getErr != nil {
+	if _, getErr := csA.RbacV1().ClusterRoles().Get(ctx, roleName, metav1.GetOptions{}); getErr != nil {
 		t.Fatalf("cluster=%s get clusterrole: %v", clusterA, getErr)
-	} else if got.Labels[mc.DefaultClusterAnnotation] != clusterA {
-		t.Fatalf("cluster=%s clusterrole missing label %q=%q labels=%v", clusterA, mc.DefaultClusterAnnotation, clusterA, got.Labels)
 	}
 	t.Cleanup(func() {
 		_ = csA.RbacV1().ClusterRoles().Delete(context.Background(), roleName, metav1.DeleteOptions{})
@@ -70,10 +67,8 @@ func TestRBACIsolationAcrossClusters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cluster=%s create clusterrolebinding: %v", clusterA, err)
 	}
-	if got, getErr := csA.RbacV1().ClusterRoleBindings().Get(ctx, bindingName, metav1.GetOptions{}); getErr != nil {
+	if _, getErr := csA.RbacV1().ClusterRoleBindings().Get(ctx, bindingName, metav1.GetOptions{}); getErr != nil {
 		t.Fatalf("cluster=%s get clusterrolebinding: %v", clusterA, getErr)
-	} else if got.Labels[mc.DefaultClusterAnnotation] != clusterA {
-		t.Fatalf("cluster=%s clusterrolebinding missing label %q=%q labels=%v", clusterA, mc.DefaultClusterAnnotation, clusterA, got.Labels)
 	}
 	t.Cleanup(func() {
 		_ = csA.RbacV1().ClusterRoleBindings().Delete(context.Background(), bindingName, metav1.DeleteOptions{})
@@ -141,7 +136,7 @@ func TestServiceAccountTokenIsolationAcrossClusters(t *testing.T) {
 	waitForTokenReview(ctx, t, csA, tokenRoot, false)
 }
 
-func TestRBACCreateSetsClusterLabel(t *testing.T) {
+func TestRBACCreateClusterRole(t *testing.T) {
 	etcd := os.Getenv("ETCD_ENDPOINTS")
 	s := startAPIServer(t, etcd)
 
@@ -165,8 +160,8 @@ func TestRBACCreateSetsClusterLabel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cluster=%s create clusterrole: %v", clusterA, err)
 	}
-	if obj.Labels[mc.DefaultClusterAnnotation] != clusterA {
-		t.Fatalf("expected cluster label %q=%q, got labels=%v", mc.DefaultClusterAnnotation, clusterA, obj.Labels)
+	if obj == nil {
+		t.Fatalf("expected created clusterrole object")
 	}
 }
 

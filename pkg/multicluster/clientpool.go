@@ -9,6 +9,10 @@ import (
 	"k8s.io/client-go/rest"
 )
 
+// ErrMissingClientFactory is returned when a manager requires a client pool
+// but none was configured.
+var ErrMissingClientFactory = fmt.Errorf("missing client factory for cluster operations")
+
 // ClientPool caches per-cluster REST clients/transports to avoid rebuilding
 // client-go machinery for every request.
 type ClientPool struct {
