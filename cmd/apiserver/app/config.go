@@ -32,6 +32,8 @@ import (
 	genericfilters "k8s.io/apiserver/pkg/endpoints/filters"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/storage"
+	storagefeature "k8s.io/apiserver/pkg/storage/feature"
 	serverfilters "k8s.io/apiserver/pkg/server/filters"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/apiserver/pkg/util/webhook"
@@ -40,10 +42,12 @@ import (
 	aggregatorscheme "k8s.io/kube-aggregator/pkg/apiserver/scheme"
 
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/controlplane"
 	controlplaneapiserver "k8s.io/kubernetes/pkg/controlplane/apiserver"
 	"k8s.io/kubernetes/pkg/features"
 	generatedopenapi "k8s.io/kubernetes/pkg/generated/openapi"
+	servicestore "k8s.io/kubernetes/pkg/registry/core/service/storage"
 
 	"github.com/kplane-dev/apiserver/cmd/apiserver/app/options"
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
@@ -129,6 +133,18 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	clientPool := mc.NewClientPool(genericConfig.LoopbackClientConfig, mcOpts.PathPrefix, mcOpts.ControlPlaneSegment)
 	informerRegistry := mc.NewInformerRegistry(wait.ContextForChannel(genericConfig.DrainedNotify()))
 	mcOpts.InformerRegistry = informerRegistry
+	if opts.SpannerProject != "" {
+		mcOpts.Spanner = &mc.SpannerConfig{
+			Project:      opts.SpannerProject,
+			Instance:     opts.SpannerInstance,
+			Database:     opts.SpannerDatabase,
+			EmulatorHost: opts.SpannerEmulatorHost,
+		}
+		// Spanner implements RequestWatchProgress natively via its
+		// broadcaster. Tell the feature checker so the cacher allows
+		// SendInitialEvents (WatchList) watches.
+		storagefeature.SetFeatureSupported(storage.RequestWatchProgress, true)
+	}
 	var crdRuntimeMgr *mcbootstrap.CRDRuntimeManager
 	systemNamespaceBootstrapper := mcbootstrap.NewSystemNamespaceBootstrapper(mcbootstrap.SystemNamespaceOptions{
 		ClientForCluster: clientPool.KubeClientForCluster,
@@ -234,6 +250,40 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	if c.KubeAPIs.ControlPlane.Generic.RESTOptionsGetter != nil {
 		c.KubeAPIs.ControlPlane.Generic.RESTOptionsGetter = decorateRESTOptionsGetter("controlplane", c.KubeAPIs.ControlPlane.Generic.RESTOptionsGetter, mcOpts)
 	}
+
+	// Per-cluster service allocators: create an AllocatorRegistry so each VCP
+	// gets its own ClusterIP and NodePort bitmap, bypassing the shared root range.
+	serviceStorageConfig, err := storageFactory.NewConfig(api.Resource("services"), &api.Service{})
+	if err != nil {
+		return nil, err
+	}
+	var allocBackendFactory mcbootstrap.StorageFactory
+	if mcOpts.Spanner != nil {
+		sf := mc.NewSpannerBackendFactory(mcOpts.Spanner)
+		allocBackendFactory = mcbootstrap.StorageFactory(sf)
+	}
+	allocatorRegistry := mcbootstrap.NewAllocatorRegistry(mcbootstrap.AllocatorRegistryOptions{
+		PrimaryServiceCIDR:   opts.PrimaryServiceClusterIPRange,
+		SecondaryServiceCIDR: opts.SecondaryServiceClusterIPRange,
+		NodePortRange:        opts.ServiceNodePortRange,
+		ServiceStorageConfig: serviceStorageConfig.ForResource(api.Resource("serviceipallocations")),
+		BackendFactory:       allocBackendFactory,
+	})
+	c.KubeAPIs.Extra.ServiceRESTHook = func(rest *servicestore.REST) {
+		rest.ClusterAllocators = func(ctx context.Context) *servicestore.Allocators {
+			cid, _, _ := mc.FromContext(ctx)
+			if cid == "" || cid == mcOpts.DefaultCluster {
+				return nil // use root allocators
+			}
+			alloc, err := allocatorRegistry.AllocatorsForCluster(cid)
+			if err != nil {
+				klog.Errorf("mc.allocatorRegistry failed cluster=%s: %v", cid, err)
+				return nil // fall back to root allocators
+			}
+			return alloc
+		}
+	}
+
 	targetPort := 443
 	if opts.SecureServing != nil && opts.SecureServing.BindPort > 0 {
 		targetPort = opts.SecureServing.BindPort
@@ -254,6 +304,11 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		TargetPort:       targetPort,
 		NodePort:         opts.KubernetesServiceNodePort,
 	})
+	allocatorRepairMgr := mcbootstrap.NewAllocatorRepairManager(mcbootstrap.AllocatorRepairOptions{
+		ClientForCluster: clientPool.KubeClientForCluster,
+		StopChForCluster: stopChForCluster,
+		Registry:         allocatorRegistry,
+	})
 	mcOpts.OnClusterSelected = func(clusterID string) {
 		// Preserve upstream root bootstrap as-is; only add multicluster bootstrap for non-root VCPs.
 		if clusterID == mcOpts.DefaultCluster {
@@ -265,6 +320,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		go serviceCIDRBootstrapper.Ensure(clusterID)
 		go rbacBootstrapper.Ensure(clusterID)
 		go internalControllerMgr.Ensure(clusterID)
+		go allocatorRepairMgr.Ensure(clusterID)
 		if opts.KubernetesServiceMode == options.KubernetesServiceModePerClusterAutoIP {
 			go kubeServiceControllerMgr.Ensure(clusterID)
 		}

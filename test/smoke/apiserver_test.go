@@ -23,6 +23,7 @@ import (
 	"time"
 
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
+	spannerstore "github.com/kplane-dev/spanner"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -116,6 +117,60 @@ type apiserverOptions struct {
 	etcdPrefix  string
 	port        int
 	extraArgs   []string
+	// spannerDB, when non-empty, adds --spanner-* flags to use Spanner storage.
+	spannerDB string
+}
+
+func storageBackend() string {
+	return os.Getenv("KPLANE_STORAGE_BACKEND") // "" or "spanner"
+}
+
+func spannerEmulatorHost() string {
+	if h := os.Getenv("SPANNER_EMULATOR_HOST"); h != "" {
+		return h
+	}
+	return "localhost:9010"
+}
+
+var spannerInstanceOnce sync.Once
+
+func ensureSpannerInstance(t *testing.T) {
+	t.Helper()
+	spannerInstanceOnce.Do(func() {
+		cfg := spannerstore.SpannerConfig{
+			Project:      "test-project",
+			Instance:     "test-instance",
+			EmulatorHost: spannerEmulatorHost(),
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := spannerstore.EnsureInstance(ctx, cfg); err != nil {
+			t.Fatalf("EnsureInstance: %v", err)
+		}
+	})
+}
+
+func setupSpannerDB(t *testing.T) string {
+	t.Helper()
+	ensureSpannerInstance(t)
+	dbName := fmt.Sprintf("smoke_%d", time.Now().UnixNano())
+	cfg := spannerstore.SpannerConfig{
+		Project:      "test-project",
+		Instance:     "test-instance",
+		Database:     dbName,
+		EmulatorHost: spannerEmulatorHost(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := spannerstore.EnsureSchema(ctx, cfg); err != nil {
+		t.Fatalf("EnsureSchema for smoke test: %v", err)
+	}
+	t.Cleanup(func() {
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer dropCancel()
+		_ = spannerstore.DropDatabase(dropCtx, cfg)
+	})
+	return dbName
 }
 
 func startAPIServer(t *testing.T, etcdEndpoints string) *testAPIServer {
@@ -124,6 +179,11 @@ func startAPIServer(t *testing.T, etcdEndpoints string) *testAPIServer {
 
 func startAPIServerWithOptions(t *testing.T, etcdEndpoints string, opts apiserverOptions) *testAPIServer {
 	t.Helper()
+	if storageBackend() == "spanner" {
+		if opts.spannerDB == "" {
+			opts.spannerDB = setupSpannerDB(t)
+		}
+	}
 	if strings.TrimSpace(etcdEndpoints) == "" {
 		t.Skip("ETCD_ENDPOINTS is not set; skipping integration smoke tests")
 	}
@@ -175,6 +235,14 @@ func startAPIServerWithOptions(t *testing.T, etcdEndpoints string, opts apiserve
 	}
 	if opts.rootCluster != mc.DefaultClusterName {
 		args = append(args, "--root-control-plane-name="+opts.rootCluster)
+	}
+	if opts.spannerDB != "" {
+		args = append(args,
+			"--spanner-project=test-project",
+			"--spanner-instance=test-instance",
+			"--spanner-database="+opts.spannerDB,
+			"--spanner-emulator-host="+spannerEmulatorHost(),
+		)
 	}
 	if len(opts.extraArgs) > 0 {
 		args = append(args, opts.extraArgs...)

@@ -25,6 +25,10 @@ func TestRBACIsolationAfterAPIServerRestart(t *testing.T) {
 	port := mustFreePort(t)
 	prefix := fmt.Sprintf("/registry-smoke-restart-rbac-%d", time.Now().UnixNano())
 	opts := apiserverOptions{etcdPrefix: prefix, port: port}
+	// Pre-create the Spanner database so both apiserver instances share it.
+	if storageBackend() == "spanner" {
+		opts.spannerDB = setupSpannerDB(t)
+	}
 
 	s1 := startAPIServerWithOptions(t, etcd, opts)
 	clusterA := "c-" + randSuffix(3)

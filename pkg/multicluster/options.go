@@ -18,6 +18,15 @@ import (
 //
 // These defaults are safe and aim for lowest watch cardinality.
 
+// SpannerConfig holds connection details for a Spanner backend.
+// When set on Options, storage uses Spanner instead of etcd.
+type SpannerConfig struct {
+	Project      string
+	Instance     string
+	Database     string
+	EmulatorHost string // for development/testing
+}
+
 type Options struct {
 	EtcdPrefix           string
 	DefaultCluster       string
@@ -34,6 +43,8 @@ type Options struct {
 	// InformerRegistry provides MultiClusterInformer instances for resource types.
 	// Set by config.go and used by storage.go to register clusteredStorage instances.
 	InformerRegistry *InformerRegistry
+	// Spanner, when non-nil, selects Spanner as the storage backend instead of etcd.
+	Spanner *SpannerConfig
 }
 
 // ResourceScope defines which keyspace view a request should use.

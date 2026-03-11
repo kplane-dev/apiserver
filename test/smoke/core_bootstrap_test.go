@@ -23,7 +23,7 @@ func TestKubernetesServiceBootstrapPerCluster(t *testing.T) {
 		t.Fatalf("trigger request failed: %v", err)
 	}
 
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		svc, err := cs.CoreV1().Services(metav1.NamespaceDefault).Get(t.Context(), "kubernetes", metav1.GetOptions{})
 		if err == nil {

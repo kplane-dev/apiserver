@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"sync"
+	"time"
 
 	"k8s.io/klog/v2"
 )
@@ -79,7 +80,21 @@ func (c *MulticlusterCRDController) run() {
 		case clusterID := <-c.queue:
 			if c.runtimeManager != nil {
 				if err := c.runtimeManager.EnsureCluster(clusterID, c.stopCh); err != nil {
-					klog.Errorf("mc.crdController ensure cluster failed cluster=%s err=%v", clusterID, err)
+					klog.Warningf("mc.crdController ensure cluster failed cluster=%s err=%v (will retry)", clusterID, err)
+					// Re-enqueue after a short delay. Storage may not be
+					// registered yet if the apiextensions server hasn't
+					// finished construction.
+					go func() {
+						select {
+						case <-c.stopCh:
+						case <-time.After(500 * time.Millisecond):
+							c.mu.Lock()
+							delete(c.enqueued, clusterID)
+							c.mu.Unlock()
+							c.EnsureCluster(clusterID)
+						}
+					}()
+					continue
 				}
 			}
 

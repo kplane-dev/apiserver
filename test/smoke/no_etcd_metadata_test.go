@@ -18,6 +18,9 @@ import (
 // raw etcd values to verify that cluster identity is NOT stored as labels or
 // annotations on the object. Identity is derived entirely from the etcd key path.
 func TestNoIdentityMetadataInEtcd(t *testing.T) {
+	if storageBackend() == "spanner" {
+		t.Skip("test reads raw etcd data; not applicable to Spanner backend")
+	}
 	etcdEndpoints := os.Getenv("ETCD_ENDPOINTS")
 	if etcdEndpoints == "" {
 		t.Skip("ETCD_ENDPOINTS not set")

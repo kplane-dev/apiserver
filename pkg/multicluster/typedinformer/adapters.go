@@ -6,8 +6,10 @@ import (
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	admissionregistrationlisters "k8s.io/client-go/listers/admissionregistration/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
@@ -63,7 +65,7 @@ func (l *namespaceLister) List(sel labels.Selector) (ret []*corev1.Namespace, er
 func (l *namespaceLister) Get(name string) (*corev1.Namespace, error) {
 	obj, ok := l.mci.Get(l.cluster, "", name)
 	if !ok {
-		return nil, fmt.Errorf("namespace %q not found", name)
+		return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "namespaces"}, name)
 	}
 	return convert[corev1.Namespace](obj)
 }
@@ -139,7 +141,7 @@ func (l *secretNamespaceLister) List(sel labels.Selector) (ret []*corev1.Secret,
 func (l *secretNamespaceLister) Get(name string) (*corev1.Secret, error) {
 	obj, ok := l.parent.mci.Get(l.parent.cluster, l.namespace, name)
 	if !ok {
-		return nil, fmt.Errorf("secret %s/%s not found", l.namespace, name)
+		return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, name)
 	}
 	return convert[corev1.Secret](obj)
 }
@@ -193,7 +195,7 @@ func (l *serviceAccountNamespaceLister) List(sel labels.Selector) (ret []*corev1
 func (l *serviceAccountNamespaceLister) Get(name string) (*corev1.ServiceAccount, error) {
 	obj, ok := l.parent.mci.Get(l.parent.cluster, l.namespace, name)
 	if !ok {
-		return nil, fmt.Errorf("serviceaccount %s/%s not found", l.namespace, name)
+		return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "serviceaccounts"}, name)
 	}
 	return convert[corev1.ServiceAccount](obj)
 }
@@ -247,7 +249,7 @@ func (l *podNamespaceLister) List(sel labels.Selector) (ret []*corev1.Pod, err e
 func (l *podNamespaceLister) Get(name string) (*corev1.Pod, error) {
 	obj, ok := l.parent.mci.Get(l.parent.cluster, l.namespace, name)
 	if !ok {
-		return nil, fmt.Errorf("pod %s/%s not found", l.namespace, name)
+		return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, name)
 	}
 	return convert[corev1.Pod](obj)
 }
@@ -282,7 +284,7 @@ func (l *nodeLister) List(sel labels.Selector) (ret []*corev1.Node, err error) {
 func (l *nodeLister) Get(name string) (*corev1.Node, error) {
 	obj, ok := l.mci.Get(l.cluster, "", name)
 	if !ok {
-		return nil, fmt.Errorf("node %q not found", name)
+		return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "nodes"}, name)
 	}
 	return convert[corev1.Node](obj)
 }
@@ -336,7 +338,7 @@ func (l *serviceNamespaceLister) List(sel labels.Selector) (ret []*corev1.Servic
 func (l *serviceNamespaceLister) Get(name string) (*corev1.Service, error) {
 	obj, ok := l.parent.mci.Get(l.parent.cluster, l.namespace, name)
 	if !ok {
-		return nil, fmt.Errorf("service %s/%s not found", l.namespace, name)
+		return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "services"}, name)
 	}
 	return convert[corev1.Service](obj)
 }
@@ -390,7 +392,7 @@ func (l *endpointSliceNamespaceLister) List(sel labels.Selector) (ret []*discove
 func (l *endpointSliceNamespaceLister) Get(name string) (*discoveryv1.EndpointSlice, error) {
 	obj, ok := l.parent.mci.Get(l.parent.cluster, l.namespace, name)
 	if !ok {
-		return nil, fmt.Errorf("endpointslice %s/%s not found", l.namespace, name)
+		return nil, apierrors.NewNotFound(schema.GroupResource{Group: "discovery.k8s.io", Resource: "endpointslices"}, name)
 	}
 	return convert[discoveryv1.EndpointSlice](obj)
 }
@@ -425,7 +427,7 @@ func (l *mutatingWebhookConfigurationLister) List(sel labels.Selector) (ret []*a
 func (l *mutatingWebhookConfigurationLister) Get(name string) (*admissionregistrationv1.MutatingWebhookConfiguration, error) {
 	obj, ok := l.mci.Get(l.cluster, "", name)
 	if !ok {
-		return nil, fmt.Errorf("mutatingwebhookconfiguration %q not found", name)
+		return nil, apierrors.NewNotFound(schema.GroupResource{Group: "admissionregistration.k8s.io", Resource: "mutatingwebhookconfigurations"}, name)
 	}
 	return convert[admissionregistrationv1.MutatingWebhookConfiguration](obj)
 }
@@ -460,7 +462,7 @@ func (l *validatingWebhookConfigurationLister) List(sel labels.Selector) (ret []
 func (l *validatingWebhookConfigurationLister) Get(name string) (*admissionregistrationv1.ValidatingWebhookConfiguration, error) {
 	obj, ok := l.mci.Get(l.cluster, "", name)
 	if !ok {
-		return nil, fmt.Errorf("validatingwebhookconfiguration %q not found", name)
+		return nil, apierrors.NewNotFound(schema.GroupResource{Group: "admissionregistration.k8s.io", Resource: "validatingwebhookconfigurations"}, name)
 	}
 	return convert[admissionregistrationv1.ValidatingWebhookConfiguration](obj)
 }

@@ -27,7 +27,10 @@ import (
 
 	"github.com/kplane-dev/apiserver/pkg/multicluster/internalcap"
 	mcstorage "github.com/kplane-dev/apiserver/pkg/multicluster/storage"
+	spanner "cloud.google.com/go/spanner"
+	spannerstore "github.com/kplane-dev/spanner"
 	extstorage "github.com/kplane-dev/storage"
+	"k8s.io/apiserver/pkg/storage/value/encrypt/identity"
 )
 
 // RESTOptionsDecorator wraps the underlying getter to inject a decorator that
@@ -71,10 +74,14 @@ func (w RESTOptionsDecorator) GetRESTOptions(resource schema.GroupResource, exam
 	// identity hooks (IdentityFromKey, WrapWatchObject, UnwrapObject) and
 	// sets WrapDecodedObject on the etcd3 storage config so that decoded
 	// objects carry their storage key through the watch.Event boundary.
-	base := extstorage.StorageWithClusterIdentity(extstorage.DecoratorConfig{
+	decoratorCfg := extstorage.DecoratorConfig{
 		KeyLayout:     extstorage.DefaultKeyLayout(),
 		GroupResource: resource,
-	})
+	}
+	if w.Options.Spanner != nil {
+		decoratorCfg.BackendFactory = NewSpannerBackendFactory(w.Options.Spanner)
+	}
+	base := extstorage.StorageWithClusterIdentity(decoratorCfg)
 	base = wrapBaseDecorator(base, w.Options)
 	opts.Decorator = func(
 		config *storagebackend.ConfigForResource,
@@ -439,4 +446,56 @@ func (c *clusteredStorage) ensureStore() (storage.Interface, error) {
 	c.store = store
 	c.destroyFn = destroy
 	return c.store, nil
+}
+
+// NewSpannerBackendFactory creates a BackendFactory from a SpannerConfig.
+// The factory creates Spanner-backed storage.Interface instances using the
+// same transformer pipeline as etcd. A single Spanner client is shared across
+// all resource stores to avoid session pool explosion.
+func NewSpannerBackendFactory(cfg *SpannerConfig) extstorage.BackendFactory {
+	var (
+		sharedClient *spanner.Client
+		clientOnce   sync.Once
+		clientErr    error
+	)
+
+	return func(
+		config *storagebackend.ConfigForResource,
+		newFunc, newListFunc func() runtime.Object,
+		resourcePrefix string,
+	) (storage.Interface, factory.DestroyFunc, error) {
+		clientOnce.Do(func() {
+			spannerCfg := spannerstore.SpannerConfig{
+				Project:      cfg.Project,
+				Instance:     cfg.Instance,
+				Database:     cfg.Database,
+				EmulatorHost: cfg.EmulatorHost,
+			}
+			sharedClient, clientErr = spannerCfg.NewClient(context.Background())
+		})
+		if clientErr != nil {
+			return nil, nil, fmt.Errorf("creating spanner client: %w", clientErr)
+		}
+
+		transformer := config.Transformer
+		if transformer == nil {
+			transformer = identity.NewEncryptCheckTransformer()
+		}
+
+		s := spannerstore.NewStore(
+			sharedClient,
+			config.Codec,
+			newFunc,
+			newListFunc,
+			config.Prefix,
+			resourcePrefix,
+			transformer,
+			config.WrapDecodedObject,
+		)
+
+		// Individual stores don't close the shared client.
+		destroyFunc := func() {}
+
+		return s, destroyFunc, nil
+	}
 }

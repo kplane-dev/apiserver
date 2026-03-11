@@ -64,6 +64,13 @@ type Extra struct {
 	EndpointReconcilerType string
 
 	MasterCount int
+
+	// Spanner backend flags. When SpannerProject is non-empty, storage uses
+	// Spanner instead of etcd for multicluster resource data.
+	SpannerProject      string
+	SpannerInstance     string
+	SpannerDatabase     string
+	SpannerEmulatorHost string
 }
 
 const (
@@ -123,6 +130,16 @@ func (s *ServerRunOptions) Flags() (fss cliflag.NamedFlagSets) {
 		"Kubernetes default service strategy across control planes: 'shared' (upstream root-only) or 'per-cluster-autoip' (create/reconcile default/kubernetes in each virtual control plane with allocator-assigned ClusterIP).")
 	mcfs.StringVar(&s.ServiceCIDRSharingMode, "service-cidr-sharing-mode", s.ServiceCIDRSharingMode,
 		"Service CIDR strategy across control planes: 'shared' keeps root-managed defaults only; 'per-cluster' bootstraps default ServiceCIDR in each virtual control plane.")
+
+	spannerfs := fss.FlagSet("spanner")
+	spannerfs.StringVar(&s.SpannerProject, "spanner-project", s.SpannerProject,
+		"GCP project ID for Spanner storage backend. When set, multicluster resource storage uses Spanner instead of etcd.")
+	spannerfs.StringVar(&s.SpannerInstance, "spanner-instance", s.SpannerInstance,
+		"Spanner instance ID.")
+	spannerfs.StringVar(&s.SpannerDatabase, "spanner-database", s.SpannerDatabase,
+		"Spanner database name.")
+	spannerfs.StringVar(&s.SpannerEmulatorHost, "spanner-emulator-host", s.SpannerEmulatorHost,
+		"Spanner emulator host:port for local development (e.g. localhost:9010). Disables TLS and authentication.")
 
 	fs := fss.FlagSet("misc")
 
