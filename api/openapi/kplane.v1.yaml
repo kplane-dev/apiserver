@@ -1,0 +1,424 @@
+openapi: 3.1.0
+info:
+  title: kplane API
+  version: 0.1.0
+  summary: kplane-native primitives for virtual control planes
+  description: |
+    The kplane apiserver exposes two surfaces beyond the standard Kubernetes
+    REST API:
+
+    1. **`GET /clusters/{cluster}/control-plane/snapshot`** — an aggregate,
+       in-memory read of every resource type with a live informer for the
+       requested virtual control plane (VCP). Designed for RL/agent rollouts
+       where you need to score plane state in a single round-trip.
+
+    2. **`kind: Fleet` (`kplane.dev/v1`)** — a Kubernetes-style CRD that
+       declares N VCPs derived from a template. Reconciled by an in-process
+       controller that primes members via the same bootstrap pipeline organic
+       traffic triggers.
+
+    Fleet REST endpoints follow standard Kubernetes API conventions and their
+    full OpenAPI surface is also published live at
+    `/openapi/v3/apis/kplane.dev/v1`. The Fleet schemas here are the
+    authoritative version for SDK code generation.
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+  contact:
+    name: kplane
+    url: https://kplane.dev
+
+servers:
+  - url: "https://{host}"
+    description: Apiserver
+    variables:
+      host:
+        default: "127.0.0.1:6443"
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: snapshot
+    description: Aggregate in-memory reads of a virtual control plane
+  - name: fleet
+    description: Declarative N-plane provisioning
+
+paths:
+  /clusters/{cluster}/control-plane/snapshot:
+    get:
+      operationId: getSnapshot
+      summary: Aggregate snapshot of a virtual control plane
+      description: |
+        Returns the contents of every live `MultiClusterInformer` for the
+        requested cluster, served from in-memory caches (no etcd read). Use
+        this to score an agent rollout or capture a trajectory step.
+      tags: [snapshot]
+      parameters:
+        - $ref: "#/components/parameters/Cluster"
+        - in: query
+          name: resource
+          description: Comma-separated plural resource names to include. Omit for all.
+          required: false
+          schema:
+            type: string
+          example: "pods,configmaps"
+        - in: query
+          name: includeEmpty
+          description: Include resources with zero items (default false).
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: warm
+          description: |
+            Force creation of `MultiClusterInformer`s for every registered
+            storage before snapshotting. Off by default; enable only when you
+            understand that it starts new watches that persist after the
+            request completes.
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Snapshot payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Snapshot"
+          headers:
+            X-Snapshot-Cluster:
+              schema: { type: string }
+              description: The cluster the snapshot was taken from.
+            X-Snapshot-Time:
+              schema: { type: string, format: date-time }
+              description: Wall-clock time the snapshot was assembled.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /apis/kplane.dev/v1/fleets:
+    get:
+      operationId: listFleets
+      summary: List all Fleets in the root control plane
+      tags: [fleet]
+      responses:
+        "200":
+          description: FleetList
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FleetList"
+    post:
+      operationId: createFleet
+      summary: Create a Fleet
+      tags: [fleet]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Fleet"
+      responses:
+        "201":
+          description: Fleet created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Fleet"
+
+  /apis/kplane.dev/v1/fleets/{name}:
+    parameters:
+      - $ref: "#/components/parameters/FleetName"
+    get:
+      operationId: getFleet
+      summary: Get a Fleet by name
+      tags: [fleet]
+      responses:
+        "200":
+          description: Fleet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Fleet"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      operationId: patchFleet
+      summary: Patch a Fleet
+      tags: [fleet]
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { type: object }
+          application/strategic-merge-patch+json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Patched Fleet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Fleet"
+    delete:
+      operationId: deleteFleet
+      summary: Delete a Fleet
+      tags: [fleet]
+      responses:
+        "200":
+          description: Deleted
+
+  /apis/kplane.dev/v1/fleets/{name}/status:
+    parameters:
+      - $ref: "#/components/parameters/FleetName"
+    get:
+      operationId: getFleetStatus
+      summary: Get only the .status subresource
+      tags: [fleet]
+      responses:
+        "200":
+          description: Fleet with status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Fleet"
+    patch:
+      operationId: patchFleetStatus
+      summary: Patch .status subresource
+      tags: [fleet]
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: Patched Fleet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Fleet"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Kubernetes bearer token authentication.
+
+  parameters:
+    Cluster:
+      in: path
+      name: cluster
+      required: true
+      description: Virtual control plane (VCP) ID.
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+      example: "team-alpha"
+    FleetName:
+      in: path
+      name: name
+      required: true
+      schema:
+        type: string
+      example: "rl-rollout"
+
+  responses:
+    BadRequest:
+      description: Bad request
+    Unauthorized:
+      description: Unauthenticated
+    Forbidden:
+      description: Forbidden
+    NotFound:
+      description: Not found
+    ServerError:
+      description: Internal server error
+
+  schemas:
+    # ---------------- Snapshot ----------------
+    Snapshot:
+      type: object
+      required: [cluster, snapshotTime, liveResources, resources]
+      properties:
+        cluster:
+          type: string
+          description: The cluster (VCP ID) this snapshot was taken from.
+        snapshotTime:
+          type: string
+          format: date-time
+          description: Wall-clock time the snapshot was assembled.
+        liveResources:
+          type: integer
+          description: Count of GroupResources with a live MultiClusterInformer at snapshot time.
+        resources:
+          type: array
+          description: Per-resource sections.
+          items:
+            $ref: "#/components/schemas/SnapshotResource"
+
+    SnapshotResource:
+      type: object
+      required: [group, resource, synced, itemCount, items]
+      properties:
+        group:
+          type: string
+          description: API group, empty string for core.
+        resource:
+          type: string
+          description: Plural resource name.
+        synced:
+          type: boolean
+          description: Whether the underlying MultiClusterInformer has completed its initial sync.
+        itemCount:
+          type: integer
+        items:
+          type: array
+          description: |
+            Resource objects, with `metadata.managedFields` stripped to keep
+            payloads tractable. Schema is whatever the underlying K8s
+            resource defines; clients should accept arbitrary object shapes
+            here and validate against per-resource schemas if needed.
+          items:
+            type: object
+            additionalProperties: true
+
+    # ---------------- Fleet ----------------
+    Fleet:
+      type: object
+      required: [apiVersion, kind, metadata, spec]
+      properties:
+        apiVersion:
+          type: string
+          enum: ["kplane.dev/v1"]
+        kind:
+          type: string
+          enum: ["Fleet"]
+        metadata:
+          $ref: "#/components/schemas/ObjectMeta"
+        spec:
+          $ref: "#/components/schemas/FleetSpec"
+        status:
+          $ref: "#/components/schemas/FleetStatus"
+
+    FleetList:
+      type: object
+      required: [apiVersion, kind, items]
+      properties:
+        apiVersion:
+          type: string
+          enum: ["kplane.dev/v1"]
+        kind:
+          type: string
+          enum: ["FleetList"]
+        metadata:
+          $ref: "#/components/schemas/ListMeta"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Fleet"
+
+    FleetSpec:
+      type: object
+      required: [replicas]
+      properties:
+        replicas:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Desired number of VCPs in this Fleet.
+        namePrefix:
+          type: string
+          description: |
+            Synthesized cluster IDs use this prefix plus a 4-digit index
+            (e.g. `rl-0000`). Defaults to `<fleet-name>-`. Ignored when
+            `names` is non-empty.
+        names:
+          type: array
+          description: Explicit cluster IDs. Length must equal `replicas`.
+          items:
+            type: string
+        ttlSeconds:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Reserved for future use. V0 does not garbage-collect VCPs when a
+            Fleet is deleted; this field is parsed and stored but not yet
+            enforced.
+
+    FleetStatus:
+      type: object
+      properties:
+        observedGeneration:
+          type: integer
+          format: int64
+        readyReplicas:
+          type: integer
+          format: int32
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/FleetMember"
+
+    FleetMember:
+      type: object
+      required: [clusterID, phase]
+      properties:
+        clusterID:
+          type: string
+        phase:
+          type: string
+          enum: [Pending, Ready, Failed]
+        message:
+          type: string
+        lastTransitionTime:
+          type: string
+          format: date-time
+
+    # ---------------- Common K8s metadata ----------------
+    ObjectMeta:
+      type: object
+      properties:
+        name:
+          type: string
+        namespace:
+          type: string
+        generation:
+          type: integer
+          format: int64
+        resourceVersion:
+          type: string
+        creationTimestamp:
+          type: string
+          format: date-time
+        uid:
+          type: string
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+        annotations:
+          type: object
+          additionalProperties:
+            type: string
+
+    ListMeta:
+      type: object
+      properties:
+        resourceVersion:
+          type: string
+        continue:
+          type: string
+        remainingItemCount:
+          type: integer
+          format: int64

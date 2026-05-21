@@ -148,6 +148,9 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	genericConfig.BuildHandlerChainFunc = func(h http.Handler, conf *server.Config) http.Handler {
 		ex := mc.PathExtractor{PathPrefix: mcOpts.PathPrefix, ControlPlaneSegment: mcOpts.ControlPlaneSegment}
 		base := withVersionOverride(server.DefaultBuildHandlerChain(h, conf))
+		// kplane OpenAPI document is server-scoped (not per-VCP) and intentionally
+		// public so SDK generators and CI can fetch it anonymously. It is wrapped
+		// here outside the cluster router.
 		dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cid, _, _ := mc.FromContext(r.Context())
 			// kplane-native endpoints (non-K8s-resource routes) live here so they
@@ -180,7 +183,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 			}
 			base.ServeHTTP(w, r)
 		})
-		return mc.WithClusterRouting(dispatch, ex, mcOpts)
+		return withKplaneOpenAPI(mc.WithClusterRouting(dispatch, ex, mcOpts))
 	}
 
 	authManager := mcauth.NewManager(wait.ContextForChannel(genericConfig.DrainedNotify()), mcauth.Options{
@@ -402,7 +405,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 			}
 			base.ServeHTTP(w, r)
 		})
-		return mc.WithClusterRouting(dispatch, ex, mcOpts)
+		return withKplaneOpenAPI(mc.WithClusterRouting(dispatch, ex, mcOpts))
 	}
 	// Install admission chain on apiextensions as well
 	{
@@ -438,7 +441,7 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 			}
 			base.ServeHTTP(w, r)
 		})
-		return mc.WithClusterRouting(dispatch, ex, mcOpts)
+		return withKplaneOpenAPI(mc.WithClusterRouting(dispatch, ex, mcOpts))
 	}
 	// Install admission chain on aggregator
 	{

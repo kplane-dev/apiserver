@@ -320,6 +320,19 @@ on bootstrap), TTL-based destruction, and snapshot of CRD-defined types — all
 follow-ups. See [`docs/snapshot-and-fleet.md`](docs/snapshot-and-fleet.md) for
 design notes.
 
+#### OpenAPI
+The canonical OpenAPI 3 document for the kplane-native surface lives at
+[`api/openapi/kplane.v1.yaml`](api/openapi/kplane.v1.yaml) and is also served
+live by the apiserver at two server-scoped endpoints:
+
+- `GET /openapi/kplane.yaml`
+- `GET /openapi/kplane.json`
+
+These endpoints are not cluster-scoped (no `/clusters/{cid}/control-plane/`
+prefix) and are intentionally reachable anonymously so SDK generators and CI
+can fetch them without credentials. SDKs generate against this document — see
+the [Python SDK](https://github.com/kplane-dev/sdk-python) for the first one.
+
 ### Tests
 Smoke test brings up the server against etcd and probes `/readyz` and discovery:
 ```bash
