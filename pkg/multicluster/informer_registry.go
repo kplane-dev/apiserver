@@ -40,6 +40,43 @@ func (r *InformerRegistry) RegisterStorage(gr schema.GroupResource, cs *clustere
 	klog.V(2).Infof("mc.informerRegistry registered storage for %s", gr)
 }
 
+// ListRegistered returns the GroupResources for which storage has been
+// registered. Storage registration happens lazily as the apiserver wires up
+// each resource, so this set grows over the server lifetime. The returned
+// slice is a copy and safe to retain.
+func (r *InformerRegistry) ListRegistered() []schema.GroupResource {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]schema.GroupResource, 0, len(r.storages))
+	for gr := range r.storages {
+		out = append(out, gr)
+	}
+	return out
+}
+
+// ListLive returns the GroupResources for which a MultiClusterInformer has
+// already been created (i.e. at least one consumer has read or watched the
+// resource). Reading from these MCIs does not start additional watches.
+func (r *InformerRegistry) ListLive() []schema.GroupResource {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]schema.GroupResource, 0, len(r.informers))
+	for gr := range r.informers {
+		out = append(out, gr)
+	}
+	return out
+}
+
+// Peek returns the MultiClusterInformer for a resource if one has already been
+// created, without triggering cacher/MCI creation. Returns (nil, false) if no
+// MCI exists yet for the resource.
+func (r *InformerRegistry) Peek(gr schema.GroupResource) (*informer.MultiClusterInformer, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	mci, ok := r.informers[gr]
+	return mci, ok
+}
+
 // Get returns (or creates) the MultiClusterInformer for a resource.
 // Forces cacher creation via ensureStore() if needed.
 func (r *InformerRegistry) Get(gr schema.GroupResource) (*informer.MultiClusterInformer, error) {

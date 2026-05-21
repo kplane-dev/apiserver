@@ -253,6 +253,73 @@ docker run --rm -p 6443:6443 \
   --anonymous-auth=true
 ```
 
+### kplane-native endpoints
+The apiserver exposes a small set of kplane-native primitives in addition to
+the standard Kubernetes API. They are intentionally minimal in V0 — capability,
+not opinion — and are mounted *inside* the multicluster routing chain so they
+share the same auth, audit, and panic-recovery filters as regular K8s requests.
+
+#### `GET /clusters/{cluster}/control-plane/snapshot`
+Returns an aggregate read of every resource type for which the apiserver
+currently holds a live `MultiClusterInformer` in the requested cluster. The
+read is served from in-memory caches (no etcd round-trip), so it is fast
+enough to use in tight RL/agent rollout loops.
+
+Query params:
+- `resource=<plural>[,<plural>...]` &mdash; limit the snapshot to a subset of resources.
+- `includeEmpty=true` &mdash; include resources with zero items (default: omitted).
+- `warm=true` &mdash; force creation of `MultiClusterInformer`s for every
+  registered storage before snapshotting. Off by default to keep snapshots
+  cheap; turn on only when you control what gets watched.
+
+Response shape:
+```json
+{
+  "cluster": "team-alpha",
+  "snapshotTime": "2026-05-21T18:05:00.000Z",
+  "liveResources": 12,
+  "resources": [
+    {"group": "", "resource": "namespaces", "synced": true, "itemCount": 4, "items": [...]},
+    {"group": "", "resource": "configmaps", "synced": true, "itemCount": 2, "items": [...]}
+  ]
+}
+```
+
+#### `kind: Fleet` (`kplane.dev/v1`)
+A `Fleet` declares a desired number of virtual control planes derived from a
+template. The in-process `FleetController` installs the CRD into the root
+control plane on startup, then watches `Fleet` objects there and primes
+member VCPs via the same `OnClusterSelected` pipeline that organic traffic
+triggers.
+
+```yaml
+apiVersion: kplane.dev/v1
+kind: Fleet
+metadata:
+  name: rl-rollout
+spec:
+  replicas: 1000
+  namePrefix: rl-       # synthesizes rl-0000, rl-0001, ...
+  # names: ["custom-a", "custom-b"]   # alternative: explicit member IDs
+```
+
+Status reports per-member readiness and an aggregate `readyReplicas`:
+```yaml
+status:
+  observedGeneration: 1
+  readyReplicas: 998
+  members:
+  - clusterID: rl-0000
+    phase: Ready
+    lastTransitionTime: 2026-05-21T18:06:12Z
+  ...
+```
+
+V0 scope intentionally excludes scenario seeding (apply YAML into each member
+on bootstrap), TTL-based destruction, and snapshot of CRD-defined types — all
+follow-ups. See [`docs/snapshot-and-fleet.md`](docs/snapshot-and-fleet.md) for
+design notes.
+
 ### Tests
 Smoke test brings up the server against etcd and probes `/readyz` and discovery:
 ```bash

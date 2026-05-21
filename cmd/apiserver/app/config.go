@@ -150,6 +150,13 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 		base := withVersionOverride(server.DefaultBuildHandlerChain(h, conf))
 		dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cid, _, _ := mc.FromContext(r.Context())
+			// kplane-native endpoints (non-K8s-resource routes) live here so they
+			// see the cluster context but still run through the upstream auth/
+			// audit/panic-recovery chain via wrapClusterCRDHandler.
+			if matchSnapshot(r) {
+				wrapClusterCRDHandler(newSnapshotHandler(informerRegistry), conf, cid, false).ServeHTTP(w, r)
+				return
+			}
 			if cid != "" && cid != mcOpts.DefaultCluster && crdRuntimeMgr != nil {
 				if group, version, ok := apisGroupVersionFromPath(r.URL.Path); ok {
 					served, err := crdRuntimeMgr.ServesGroupVersion(cid, group, version, genericConfig.DrainedNotify())
@@ -335,6 +342,27 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 			return
 		}
 		crdController.EnsureCluster(clusterID)
+	}
+
+	// FleetController watches Fleet objects in the root control plane and
+	// primes member VCPs via the same OnClusterSelected pipeline that real
+	// traffic triggers. It installs its CRD into root on startup.
+	fleetController, fleetErr := mcbootstrap.NewFleetController(mcbootstrap.FleetControllerOptions{
+		RootCluster:              mcOpts.DefaultCluster,
+		BaseLoopbackClientConfig: genericConfig.LoopbackClientConfig,
+		PathPrefix:               mcOpts.PathPrefix,
+		ControlPlaneSegment:      mcOpts.ControlPlaneSegment,
+		EnsureCluster: func(clusterID string) {
+			if fn := mcOpts.OnClusterSelected; fn != nil {
+				fn(clusterID)
+			}
+		},
+		ClientForCluster: clientPool.KubeClientForCluster,
+	})
+	if fleetErr != nil {
+		klog.Errorf("mc.fleet controller init failed: %v", fleetErr)
+	} else {
+		fleetController.Start(genericConfig.DrainedNotify())
 	}
 	serveClusterCRD := func(w http.ResponseWriter, r *http.Request, conf *server.Config, clusterID, caller string) bool {
 		group, version, ok := apisGroupVersionFromPath(r.URL.Path)
