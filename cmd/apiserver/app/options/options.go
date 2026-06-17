@@ -23,6 +23,8 @@ import (
 	"time"
 
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
+	storagebackends "github.com/kplane-dev/storage/backends"
+	"github.com/kplane-dev/storage/registry"
 	v1 "k8s.io/api/core/v1"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	cliflag "k8s.io/component-base/cli/flag"
@@ -64,6 +66,25 @@ type Extra struct {
 	EndpointReconcilerType string
 
 	MasterCount int
+
+	// StorageBackend selects which registered storage backend serves the
+	// multicluster data plane. Defaults to "etcd3" (the legacy path);
+	// other valid values are whatever backends are registered into
+	// Backends via storagebackends.RegisterBuiltin (or by an out-of-tree
+	// custom apiserver that registers more before Validate runs).
+	//
+	// KPEP-0001: this is the single dispatch knob. Per-backend flags
+	// (--spanner-project, future --postgres-dsn, etc.) come from the
+	// backend's own AddFlags, fanned out by Backends.AddFlags. The
+	// apiserver options layer never names a specific backend.
+	StorageBackend string
+
+	// Backends is the instance-scoped registry of available storage
+	// backends. The default set is populated in NewServerRunOptions via
+	// storagebackends.RegisterBuiltin. Custom apiservers can call
+	// Backends.Register(<their>.NewOptions()) on the returned value
+	// before Flags() is invoked.
+	Backends *registry.Backends
 }
 
 const (
@@ -75,10 +96,15 @@ const (
 
 // NewServerRunOptions creates and returns ServerRunOptions according to the given featureGate and effectiveVersion of the server binary to run.
 func NewServerRunOptions() *ServerRunOptions {
+	backends := registry.New()
+	storagebackends.RegisterBuiltin(backends)
+
 	s := ServerRunOptions{
 		Options: controlplaneapiserver.NewOptions(),
 
 		Extra: Extra{
+			StorageBackend:         "etcd3",
+			Backends:               backends,
 			EndpointReconcilerType: string(reconcilers.LeaseEndpointReconcilerType),
 			KubeletConfig: kubeletclient.KubeletClientConfig{
 				Port:         ports.KubeletPort,
@@ -123,6 +149,14 @@ func (s *ServerRunOptions) Flags() (fss cliflag.NamedFlagSets) {
 		"Kubernetes default service strategy across control planes: 'shared' (upstream root-only) or 'per-cluster-autoip' (create/reconcile default/kubernetes in each virtual control plane with allocator-assigned ClusterIP).")
 	mcfs.StringVar(&s.ServiceCIDRSharingMode, "service-cidr-sharing-mode", s.ServiceCIDRSharingMode,
 		"Service CIDR strategy across control planes: 'shared' keeps root-managed defaults only; 'per-cluster' bootstraps default ServiceCIDR in each virtual control plane.")
+
+	// KPEP-0001 storage backend dispatch. Picks which registered backend
+	// services multicluster storage; backend-specific flags (e.g.
+	// --spanner-project) are bound by each backend's AddFlags below.
+	storagefs := fss.FlagSet("storage backend")
+	storagefs.StringVar(&s.StorageBackend, "storage-backend", s.StorageBackend,
+		"Storage backend for multicluster data. One of: "+strings.Join(s.Backends.Names(), ", ")+". Defaults to 'etcd3'.")
+	s.Backends.AddFlags(storagefs)
 
 	fs := fss.FlagSet("misc")
 

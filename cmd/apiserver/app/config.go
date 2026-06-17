@@ -18,6 +18,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"reflect"
 	"strings"
@@ -32,6 +33,8 @@ import (
 	genericfilters "k8s.io/apiserver/pkg/endpoints/filters"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/storage"
+	storagefeature "k8s.io/apiserver/pkg/storage/feature"
 	serverfilters "k8s.io/apiserver/pkg/server/filters"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/apiserver/pkg/util/webhook"
@@ -129,6 +132,34 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	clientPool := mc.NewClientPool(genericConfig.LoopbackClientConfig, mcOpts.PathPrefix, mcOpts.ControlPlaneSegment)
 	informerRegistry := mc.NewInformerRegistry(wait.ContextForChannel(genericConfig.DrainedNotify()))
 	mcOpts.InformerRegistry = informerRegistry
+
+	// KPEP-0001 storage backend dispatch. Resolve the registered backend
+	// named by --storage-backend, validate, build, and install the
+	// resulting Factory on mcOpts so the storage decorator uses it
+	// instead of the upstream etcd3 path. "etcd3" (or empty) keeps
+	// mcOpts.BackendFactory nil and falls through to etcd3 transparently.
+	if opts.StorageBackend != "" && opts.StorageBackend != "etcd3" {
+		backend, ok := opts.Backends.Get(opts.StorageBackend)
+		if !ok {
+			return nil, fmt.Errorf(
+				"unknown --storage-backend=%q (registered: %v)",
+				opts.StorageBackend, opts.Backends.Names(),
+			)
+		}
+		if errs := backend.Validate(); len(errs) > 0 {
+			return nil, fmt.Errorf("validating --storage-backend=%q: %v", opts.StorageBackend, errs)
+		}
+		factory, err := backend.Build()
+		if err != nil {
+			return nil, fmt.Errorf("building --storage-backend=%q: %w", opts.StorageBackend, err)
+		}
+		mcOpts.BackendFactory = factory
+		// Non-etcd backends typically implement RequestWatchProgress
+		// natively (Spanner via its broadcaster). Tell the feature
+		// checker so the cacher allows SendInitialEvents watches.
+		storagefeature.SetFeatureSupported(storage.RequestWatchProgress, true)
+	}
+
 	var crdRuntimeMgr *mcbootstrap.CRDRuntimeManager
 	systemNamespaceBootstrapper := mcbootstrap.NewSystemNamespaceBootstrapper(mcbootstrap.SystemNamespaceOptions{
 		ClientForCluster: clientPool.KubeClientForCluster,
