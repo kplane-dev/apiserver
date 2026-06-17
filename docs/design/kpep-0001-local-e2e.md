@@ -38,11 +38,13 @@ docker run -p 9010:9010 -p 9020:9020 \
   gcr.io/cloud-spanner-emulator/emulator
 ```
 
-## Provision a Spanner instance + database
+## Provision a Spanner instance
 
-The Spanner backend's `register.go` calls `cfg.NewClient(...)` which
-expects the instance and database to already exist. Use the emulator REST
-or the `gcloud spanner` CLI:
+The Spanner backend's `Options.Build()` runs `EnsureSchema` on every
+apiserver startup — it creates the database with the `kv` table + change
+stream and is idempotent (a pre-existing database is a no-op). You only
+need to create the **instance** out-of-band; the database + schema are
+handled for you on the next `./kplane-apiserver` run.
 
 ```bash
 export SPANNER_EMULATOR_HOST=localhost:9010
@@ -52,11 +54,7 @@ gcloud config set project test-project
 gcloud config set api_endpoint_overrides/spanner http://${SPANNER_EMULATOR_HOST}/
 
 gcloud spanner instances create test-instance --config=emulator-config --description=test --nodes=1
-gcloud spanner databases create kplane --instance=test-instance
 ```
-
-Apply the kv schema from `kplane-dev/storage/backends/spanner/config.go`'s
-`EnsureSchema` (it runs the DDL automatically when the apiserver starts).
 
 ## Build the apiserver
 
