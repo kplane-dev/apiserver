@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	apiserveroptions "k8s.io/apiserver/pkg/server/options"
+	storagefactory "k8s.io/apiserver/pkg/storage/storagebackend/factory"
 	_ "k8s.io/component-base/metrics/prometheus/workqueue"
 	netutils "k8s.io/utils/net"
 
@@ -47,6 +48,42 @@ type CompletedOptions struct {
 func (s *ServerRunOptions) Complete(ctx context.Context) (CompletedOptions, error) {
 	if s == nil {
 		return CompletedOptions{completedOptions: &completedOptions{}}, nil
+	}
+
+	// KPEP-0001 Option C: register the selected non-etcd3 backend with the
+	// fork's factory registry BEFORE downstream Validate runs. EtcdOptions
+	// rejects --storage-backend values it doesn't recognize, but it
+	// consults factory.IsRegistered first — registering here means
+	// "--storage-backend=spanner" passes upstream validation, and every
+	// factory.Create callsite inside upstream (CR storage, master/peer
+	// endpoint leases, service IP/NodePort allocators) dispatches to the
+	// same Spanner backend at runtime. spanner.Options.BuildFactoryBackend
+	// is idempotent (one shared client per Options) so Build/the decorator
+	// hook in config.go reuse the same instance.
+	//
+	// The backend name comes from upstream EtcdOptions's --storage-backend
+	// flag (bound to s.Etcd.StorageConfig.Type). Empty / "etcd3" / "etcd2"
+	// keep the upstream default path.
+	backendName := ""
+	if s.Etcd != nil {
+		backendName = s.Etcd.StorageConfig.Type
+	}
+	if backendName != "" && backendName != "etcd3" && backendName != "etcd2" {
+		backend, ok := s.Backends.Get(backendName)
+		if !ok {
+			return CompletedOptions{}, fmt.Errorf(
+				"unknown --storage-backend=%q (registered: %v)",
+				backendName, s.Backends.Names(),
+			)
+		}
+		if errs := backend.Validate(); len(errs) > 0 {
+			return CompletedOptions{}, fmt.Errorf("validating --storage-backend=%q: %v", backendName, errs)
+		}
+		fb, err := backend.BuildFactoryBackend()
+		if err != nil {
+			return CompletedOptions{}, fmt.Errorf("building factory backend for --storage-backend=%q: %w", backendName, err)
+		}
+		storagefactory.Register(backendName, fb)
 	}
 
 	// process s.ServiceClusterIPRange from list to Primary and Secondary

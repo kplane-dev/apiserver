@@ -133,27 +133,31 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	informerRegistry := mc.NewInformerRegistry(wait.ContextForChannel(genericConfig.DrainedNotify()))
 	mcOpts.InformerRegistry = informerRegistry
 
-	// KPEP-0001 storage backend dispatch. Resolve the registered backend
-	// named by --storage-backend, validate, build, and install the
-	// resulting Factory on mcOpts so the storage decorator uses it
-	// instead of the upstream etcd3 path. "etcd3" (or empty) keeps
-	// mcOpts.BackendFactory nil and falls through to etcd3 transparently.
-	if opts.StorageBackend != "" && opts.StorageBackend != "etcd3" {
-		backend, ok := opts.Backends.Get(opts.StorageBackend)
+	// KPEP-0001 storage backend dispatch. Options.Complete has already
+	// registered the selected backend with the fork's factory registry
+	// (so upstream EtcdOptions.Validate passed and every internal
+	// factory.Create callsite — master/peer endpoint leases, service IP/
+	// NodePort allocators — dispatches to it at runtime). Here we install
+	// the same backend's CR-storage Factory on the multicluster decorator
+	// hook. spanner.Options.Build reuses the FactoryBackend created in
+	// Complete (one shared spanner.Client per process).
+	backendName := ""
+	if opts.Etcd != nil {
+		backendName = opts.Etcd.StorageConfig.Type
+	}
+	if backendName != "" && backendName != "etcd3" && backendName != "etcd2" {
+		backend, ok := opts.Backends.Get(backendName)
 		if !ok {
 			return nil, fmt.Errorf(
 				"unknown --storage-backend=%q (registered: %v)",
-				opts.StorageBackend, opts.Backends.Names(),
+				backendName, opts.Backends.Names(),
 			)
 		}
-		if errs := backend.Validate(); len(errs) > 0 {
-			return nil, fmt.Errorf("validating --storage-backend=%q: %v", opts.StorageBackend, errs)
-		}
-		factory, err := backend.Build()
+		crFactory, err := backend.Build()
 		if err != nil {
-			return nil, fmt.Errorf("building --storage-backend=%q: %w", opts.StorageBackend, err)
+			return nil, fmt.Errorf("building --storage-backend=%q: %w", backendName, err)
 		}
-		mcOpts.BackendFactory = factory
+		mcOpts.BackendFactory = crFactory
 		// Non-etcd backends typically implement RequestWatchProgress
 		// natively (Spanner via its broadcaster). Tell the feature
 		// checker so the cacher allows SendInitialEvents watches.

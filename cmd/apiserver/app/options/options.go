@@ -67,18 +67,6 @@ type Extra struct {
 
 	MasterCount int
 
-	// StorageBackend selects which registered storage backend serves the
-	// multicluster data plane. Defaults to "etcd3" (the legacy path);
-	// other valid values are whatever backends are registered into
-	// Backends via storagebackends.RegisterBuiltin (or by an out-of-tree
-	// custom apiserver that registers more before Validate runs).
-	//
-	// KPEP-0001: this is the single dispatch knob. Per-backend flags
-	// (--spanner-project, future --postgres-dsn, etc.) come from the
-	// backend's own AddFlags, fanned out by Backends.AddFlags. The
-	// apiserver options layer never names a specific backend.
-	StorageBackend string
-
 	// Backends is the instance-scoped registry of available storage
 	// backends. The default set is populated in NewServerRunOptions via
 	// storagebackends.RegisterBuiltin. Custom apiservers can call
@@ -103,7 +91,6 @@ func NewServerRunOptions() *ServerRunOptions {
 		Options: controlplaneapiserver.NewOptions(),
 
 		Extra: Extra{
-			StorageBackend:         "etcd3",
 			Backends:               backends,
 			EndpointReconcilerType: string(reconcilers.LeaseEndpointReconcilerType),
 			KubeletConfig: kubeletclient.KubeletClientConfig{
@@ -150,12 +137,14 @@ func (s *ServerRunOptions) Flags() (fss cliflag.NamedFlagSets) {
 	mcfs.StringVar(&s.ServiceCIDRSharingMode, "service-cidr-sharing-mode", s.ServiceCIDRSharingMode,
 		"Service CIDR strategy across control planes: 'shared' keeps root-managed defaults only; 'per-cluster' bootstraps default ServiceCIDR in each virtual control plane.")
 
-	// KPEP-0001 storage backend dispatch. Picks which registered backend
-	// services multicluster storage; backend-specific flags (e.g.
-	// --spanner-project) are bound by each backend's AddFlags below.
+	// KPEP-0001 backend-specific flags (e.g. --spanner-project) are bound
+	// by each backend's AddFlags below. The selection itself reuses
+	// upstream EtcdOptions's --storage-backend flag (bound to
+	// s.Etcd.StorageConfig.Type) — Options.Complete reads that value and
+	// registers the chosen backend with the fork factory registry.
+	// Registering a second --storage-backend pflag here would collide
+	// non-deterministically with the upstream one.
 	storagefs := fss.FlagSet("storage backend")
-	storagefs.StringVar(&s.StorageBackend, "storage-backend", s.StorageBackend,
-		"Storage backend for multicluster data. One of: "+strings.Join(s.Backends.Names(), ", ")+". Defaults to 'etcd3'.")
 	s.Backends.AddFlags(storagefs)
 
 	fs := fss.FlagSet("misc")
