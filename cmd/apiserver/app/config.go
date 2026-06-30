@@ -133,14 +133,14 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	informerRegistry := mc.NewInformerRegistry(wait.ContextForChannel(genericConfig.DrainedNotify()))
 	mcOpts.InformerRegistry = informerRegistry
 
-	// KPEP-0001 storage backend dispatch. Options.Complete has already
-	// registered the selected backend with the fork's factory registry
-	// (so upstream EtcdOptions.Validate passed and every internal
-	// factory.Create callsite — master/peer endpoint leases, service IP/
-	// NodePort allocators — dispatches to it at runtime). Here we install
-	// the same backend's CR-storage Factory on the multicluster decorator
-	// hook. spanner.Options.Build reuses the FactoryBackend created in
-	// Complete (one shared spanner.Client per process).
+	// Storage backend dispatch. Options.Complete has already registered the
+	// selected backend with the fork's factory registry (so upstream
+	// EtcdOptions.Validate passed and every internal factory.Create
+	// callsite — master/peer endpoint leases, service IP/NodePort
+	// allocators — dispatches to it at runtime). Here we install the same
+	// backend's CR-storage Factory on the multicluster decorator hook.
+	// spanner.Options.Build reuses the FactoryBackend created in Complete
+	// (one shared spanner.Client per process).
 	backendName := ""
 	if opts.Etcd != nil {
 		backendName = opts.Etcd.StorageConfig.Type

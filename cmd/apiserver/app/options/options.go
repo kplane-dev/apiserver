@@ -137,9 +137,9 @@ func (s *ServerRunOptions) Flags() (fss cliflag.NamedFlagSets) {
 	mcfs.StringVar(&s.ServiceCIDRSharingMode, "service-cidr-sharing-mode", s.ServiceCIDRSharingMode,
 		"Service CIDR strategy across control planes: 'shared' keeps root-managed defaults only; 'per-cluster' bootstraps default ServiceCIDR in each virtual control plane.")
 
-	// KPEP-0001 backend-specific flags (e.g. --spanner-project) are bound
-	// by each backend's AddFlags below. The selection itself reuses
-	// upstream EtcdOptions's --storage-backend flag (bound to
+	// Backend-specific flags (e.g. --spanner-project) are bound by each
+	// backend's AddFlags below. The selection itself reuses upstream
+	// EtcdOptions's --storage-backend flag (bound to
 	// s.Etcd.StorageConfig.Type) — Options.Complete reads that value and
 	// registers the chosen backend with the fork factory registry.
 	// Registering a second --storage-backend pflag here would collide

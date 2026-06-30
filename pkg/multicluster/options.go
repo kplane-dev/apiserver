@@ -37,8 +37,8 @@ type Options struct {
 	InformerRegistry *InformerRegistry
 	// BackendFactory, when non-nil, installs a non-etcd storage backend
 	// into every per-resource storage decorator. Set by config.go after
-	// resolving --storage-backend through the KPEP-0001 registry; nil
-	// preserves the upstream etcd3 path.
+	// resolving --storage-backend through the storage backend registry;
+	// nil preserves the upstream etcd3 path.
 	BackendFactory extstorage.BackendFactory
 }
 

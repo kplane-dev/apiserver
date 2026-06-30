@@ -50,10 +50,10 @@ func (s *ServerRunOptions) Complete(ctx context.Context) (CompletedOptions, erro
 		return CompletedOptions{completedOptions: &completedOptions{}}, nil
 	}
 
-	// KPEP-0001 Option C: register the selected non-etcd3 backend with the
-	// fork's factory registry BEFORE downstream Validate runs. EtcdOptions
-	// rejects --storage-backend values it doesn't recognize, but it
-	// consults factory.IsRegistered first — registering here means
+	// Register the selected non-etcd3 backend with the fork's factory
+	// registry BEFORE downstream Validate runs. EtcdOptions rejects
+	// --storage-backend values it doesn't recognize, but it consults
+	// factory.IsRegistered first — registering here means
 	// "--storage-backend=spanner" passes upstream validation, and every
 	// factory.Create callsite inside upstream (CR storage, master/peer
 	// endpoint leases, service IP/NodePort allocators) dispatches to the

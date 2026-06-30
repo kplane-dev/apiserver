@@ -16,7 +16,7 @@ import (
 	"github.com/spf13/pflag"
 )
 
-// TestStorageBackendFlagRoutesToEtcdConfig guards the KPEP-0001 Option C
+// TestStorageBackendFlagRoutesToEtcdConfig guards the backend-selection
 // flag wiring. The backend selection comes from upstream EtcdOptions's
 // --storage-backend flag, which binds directly to s.Etcd.StorageConfig.Type.
 // Options.Complete reads that field to decide which backend to register
