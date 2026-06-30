@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/kplane-dev/apiserver/pkg/multicluster/internalcap"
+	extstorage "github.com/kplane-dev/storage"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 )
 
@@ -34,6 +35,11 @@ type Options struct {
 	// InformerRegistry provides MultiClusterInformer instances for resource types.
 	// Set by config.go and used by storage.go to register clusteredStorage instances.
 	InformerRegistry *InformerRegistry
+	// BackendFactory, when non-nil, installs a non-etcd storage backend
+	// into every per-resource storage decorator. Set by config.go after
+	// resolving --storage-backend through the storage backend registry;
+	// nil preserves the upstream etcd3 path.
+	BackendFactory extstorage.BackendFactory
 }
 
 // ResourceScope defines which keyspace view a request should use.

@@ -72,8 +72,9 @@ func (w RESTOptionsDecorator) GetRESTOptions(resource schema.GroupResource, exam
 	// sets WrapDecodedObject on the etcd3 storage config so that decoded
 	// objects carry their storage key through the watch.Event boundary.
 	base := extstorage.StorageWithClusterIdentity(extstorage.DecoratorConfig{
-		KeyLayout:     extstorage.DefaultKeyLayout(),
-		GroupResource: resource,
+		KeyLayout:      extstorage.DefaultKeyLayout(),
+		GroupResource:  resource,
+		BackendFactory: w.Options.BackendFactory,
 	})
 	base = wrapBaseDecorator(base, w.Options)
 	opts.Decorator = func(

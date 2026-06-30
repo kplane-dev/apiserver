@@ -23,6 +23,8 @@ import (
 	"time"
 
 	mc "github.com/kplane-dev/apiserver/pkg/multicluster"
+	storagebackends "github.com/kplane-dev/storage/backends"
+	"github.com/kplane-dev/storage/registry"
 	v1 "k8s.io/api/core/v1"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	cliflag "k8s.io/component-base/cli/flag"
@@ -64,6 +66,13 @@ type Extra struct {
 	EndpointReconcilerType string
 
 	MasterCount int
+
+	// Backends is the instance-scoped registry of available storage
+	// backends. The default set is populated in NewServerRunOptions via
+	// storagebackends.RegisterBuiltin. Custom apiservers can call
+	// Backends.Register(<their>.NewOptions()) on the returned value
+	// before Flags() is invoked.
+	Backends *registry.Backends
 }
 
 const (
@@ -75,10 +84,14 @@ const (
 
 // NewServerRunOptions creates and returns ServerRunOptions according to the given featureGate and effectiveVersion of the server binary to run.
 func NewServerRunOptions() *ServerRunOptions {
+	backends := registry.New()
+	storagebackends.RegisterBuiltin(backends)
+
 	s := ServerRunOptions{
 		Options: controlplaneapiserver.NewOptions(),
 
 		Extra: Extra{
+			Backends:               backends,
 			EndpointReconcilerType: string(reconcilers.LeaseEndpointReconcilerType),
 			KubeletConfig: kubeletclient.KubeletClientConfig{
 				Port:         ports.KubeletPort,
@@ -123,6 +136,16 @@ func (s *ServerRunOptions) Flags() (fss cliflag.NamedFlagSets) {
 		"Kubernetes default service strategy across control planes: 'shared' (upstream root-only) or 'per-cluster-autoip' (create/reconcile default/kubernetes in each virtual control plane with allocator-assigned ClusterIP).")
 	mcfs.StringVar(&s.ServiceCIDRSharingMode, "service-cidr-sharing-mode", s.ServiceCIDRSharingMode,
 		"Service CIDR strategy across control planes: 'shared' keeps root-managed defaults only; 'per-cluster' bootstraps default ServiceCIDR in each virtual control plane.")
+
+	// Backend-specific flags (e.g. --spanner-project) are bound by each
+	// backend's AddFlags below. The selection itself reuses upstream
+	// EtcdOptions's --storage-backend flag (bound to
+	// s.Etcd.StorageConfig.Type) — Options.Complete reads that value and
+	// registers the chosen backend with the fork factory registry.
+	// Registering a second --storage-backend pflag here would collide
+	// non-deterministically with the upstream one.
+	storagefs := fss.FlagSet("storage backend")
+	s.Backends.AddFlags(storagefs)
 
 	fs := fss.FlagSet("misc")
 

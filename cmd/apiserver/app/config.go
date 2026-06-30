@@ -18,6 +18,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"reflect"
 	"strings"
@@ -32,6 +33,8 @@ import (
 	genericfilters "k8s.io/apiserver/pkg/endpoints/filters"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/storage"
+	storagefeature "k8s.io/apiserver/pkg/storage/feature"
 	serverfilters "k8s.io/apiserver/pkg/server/filters"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/apiserver/pkg/util/webhook"
@@ -129,6 +132,38 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	clientPool := mc.NewClientPool(genericConfig.LoopbackClientConfig, mcOpts.PathPrefix, mcOpts.ControlPlaneSegment)
 	informerRegistry := mc.NewInformerRegistry(wait.ContextForChannel(genericConfig.DrainedNotify()))
 	mcOpts.InformerRegistry = informerRegistry
+
+	// Storage backend dispatch. Options.Complete has already registered the
+	// selected backend with the fork's factory registry (so upstream
+	// EtcdOptions.Validate passed and every internal factory.Create
+	// callsite — master/peer endpoint leases, service IP/NodePort
+	// allocators — dispatches to it at runtime). Here we install the same
+	// backend's CR-storage Factory on the multicluster decorator hook.
+	// spanner.Options.Build reuses the FactoryBackend created in Complete
+	// (one shared spanner.Client per process).
+	backendName := ""
+	if opts.Etcd != nil {
+		backendName = opts.Etcd.StorageConfig.Type
+	}
+	if backendName != "" && backendName != "etcd3" && backendName != "etcd2" {
+		backend, ok := opts.Backends.Get(backendName)
+		if !ok {
+			return nil, fmt.Errorf(
+				"unknown --storage-backend=%q (registered: %v)",
+				backendName, opts.Backends.Names(),
+			)
+		}
+		crFactory, err := backend.Build()
+		if err != nil {
+			return nil, fmt.Errorf("building --storage-backend=%q: %w", backendName, err)
+		}
+		mcOpts.BackendFactory = crFactory
+		// Non-etcd backends typically implement RequestWatchProgress
+		// natively (Spanner via its broadcaster). Tell the feature
+		// checker so the cacher allows SendInitialEvents watches.
+		storagefeature.SetFeatureSupported(storage.RequestWatchProgress, true)
+	}
+
 	var crdRuntimeMgr *mcbootstrap.CRDRuntimeManager
 	systemNamespaceBootstrapper := mcbootstrap.NewSystemNamespaceBootstrapper(mcbootstrap.SystemNamespaceOptions{
 		ClientForCluster: clientPool.KubeClientForCluster,
